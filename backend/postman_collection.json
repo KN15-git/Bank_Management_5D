@@ -1,0 +1,301 @@
+{
+  "info": {
+    "name": "PES Bank Management System API (Issues #2 - #7)",
+    "_postman_id": "pes-bank-management-system",
+    "description": "Postman Collection for testing Issues #2 (Auth & Login), #3 (RBAC), #4 (Account & Balance Management), #5 (Deposit Money), #6 (Withdraw Money), and #7 (Transaction Validation & Recording).\n\nNOTE: When calling state-changing endpoints (POST/PATCH), Flask checks the X-CSRF-Token header. First call 'GET /api/auth/csrf' or 'POST /api/auth/login' to obtain the token, and set it in the header as X-CSRF-Token. Flask-Login uses the session cookie automatically if 'Automatically manage cookies' is enabled in Postman.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/health",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "health"]
+        }
+      }
+    },
+    {
+      "name": "Auth - Get CSRF Token",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/auth/csrf",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "auth", "csrf"]
+        }
+      }
+    },
+    {
+      "name": "Auth - Register Customer",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"test_customer\",\n  \"email\": \"test_customer@example.com\",\n  \"full_name\": \"Test Customer\",\n  \"password\": \"SecurePass123\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/auth/register",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "auth", "register"]
+        }
+      }
+    },
+    {
+      "name": "Auth - Login",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"rahul_k\",\n  \"password\": \"Bank@1234\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/auth/login",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "auth", "login"]
+        }
+      }
+    },
+    {
+      "name": "Auth - Get Me",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/auth/me",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "auth", "me"]
+        }
+      }
+    },
+    {
+      "name": "Auth - Logout",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/auth/logout",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "auth", "logout"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - List Accounts",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Create Account",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"account_type\": \"savings\",\n  \"initial_deposit\": \"500.00\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Get Account Detail",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Get Account Balance",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/balance",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "balance"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Deposit Money (#5, #7)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": \"5000.00\",\n  \"description\": \"Branch Cash Deposit\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/deposit",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "deposit"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Withdraw Money (#6, #7)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": \"1500.00\",\n  \"description\": \"ATM Cash Withdrawal\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/withdraw",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "withdraw"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Get Transaction History (#7)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/transactions",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "transactions"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Update Status (Freeze/Close)",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"status\": \"frozen\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/status",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "status"]
+        }
+      }
+    },
+    {
+      "name": "Admin - List Users",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/users",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "users"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Update User Role",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"role\": \"employee\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/users/3/role",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "users", "3", "role"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Update User Active Status",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"is_active\": false\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/users/3/status",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "users", "3", "status"]
+        }
+      }
+    }
+  ]
+}
