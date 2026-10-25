@@ -15,6 +15,7 @@ export const AccountDetailPage = () => {
   const [txType, setTxType] = useState('deposit');
   const [txAmount, setTxAmount] = useState('');
   const [txDesc, setTxDesc] = useState('');
+  const [destAccountNumber, setDestAccountNumber] = useState('');
   const [txLoading, setTxLoading] = useState(false);
   const [txSuccess, setTxSuccess] = useState('');
   const [txError, setTxError] = useState('');
@@ -51,21 +52,55 @@ export const AccountDetailPage = () => {
       return;
     }
 
+    if (txType === 'transfer') {
+      const cleanDest = destAccountNumber.trim();
+      if (!cleanDest) {
+        setTxError('Please enter a destination account number.');
+        return;
+      }
+      if (account && cleanDest === account.account_number) {
+        setTxError('Cannot transfer funds to the same account.');
+        return;
+      }
+    }
+
     setTxLoading(true);
-    const endpoint = txType === 'deposit' ? `/api/accounts/${id}/deposit` : `/api/accounts/${id}/withdraw`;
+    const endpoint =
+      txType === 'deposit'
+        ? `/api/accounts/${id}/deposit`
+        : txType === 'withdrawal'
+        ? `/api/accounts/${id}/withdraw`
+        : `/api/accounts/${id}/transfer`;
+
+    const payload =
+      txType === 'transfer'
+        ? {
+            destination_account_number: destAccountNumber.trim(),
+            amount: txAmount,
+            description: txDesc,
+          }
+        : {
+            amount: txAmount,
+            description: txDesc,
+          };
 
     try {
       const data = await apiRequest(endpoint, {
         method: 'POST',
-        body: JSON.stringify({
-          amount: txAmount,
-          description: txDesc,
-        }),
+        body: JSON.stringify(payload),
       });
 
-      setTxSuccess(
-        `${txType === 'deposit' ? 'Deposit' : 'Withdrawal'} of ₹${data.transaction.amount} successful! Ref: ${data.transaction.reference_id}`
-      );
+      if (txType === 'transfer') {
+        const trf = data.transfer || data.transaction;
+        setTxSuccess(
+          `Transfer of ₹${trf.amount} to A/C #${trf.destination_account_number} successful! Ref: ${trf.reference_id}`
+        );
+        setDestAccountNumber('');
+      } else {
+        setTxSuccess(
+          `${txType === 'deposit' ? 'Deposit' : 'Withdrawal'} of ₹${data.transaction.amount} successful! Ref: ${data.transaction.reference_id}`
+        );
+      }
       setTxAmount('');
       setTxDesc('');
 
@@ -77,10 +112,20 @@ export const AccountDetailPage = () => {
       setAccount(accData.account);
       setTransactions(txnData.transactions || []);
     } catch (err) {
-      setTxError(err.message || `${txType === 'deposit' ? 'Deposit' : 'Withdrawal'} failed.`);
+      const actionLabel =
+        txType === 'deposit' ? 'Deposit' : txType === 'withdrawal' ? 'Withdrawal' : 'Transfer';
+      setTxError(err.message || `${actionLabel} failed.`);
     } finally {
       setTxLoading(false);
     }
+  };
+
+  const isCreditTransaction = (type) => type === 'deposit' || type === 'transfer_in';
+
+  const formatTransactionTypeLabel = (type) => {
+    if (type === 'transfer_out') return 'TRANSFER OUT';
+    if (type === 'transfer_in') return 'TRANSFER IN';
+    return (type || '').toUpperCase();
   };
 
   if (loading) {
@@ -154,12 +199,12 @@ export const AccountDetailPage = () => {
         </div>
       </div>
 
-      {/* Transaction Action Form (Deposit / Withdraw) */}
+      {/* Transaction Action Form (Deposit / Withdraw / Transfer) */}
       <div className="card transaction-action-card">
-        <h3>Transact: Deposit & Withdraw (Issues #5, #6)</h3>
+        <h3>Transact: Deposit, Withdraw &amp; Transfer (Issues #5, #6, #8, #9)</h3>
         {isClosed && (
           <div className="alert alert-danger">
-            This account is closed. No further deposits or withdrawals are permitted.
+            This account is closed. No further deposits, withdrawals, or transfers are permitted.
           </div>
         )}
         {isFrozen && (
@@ -179,13 +224,33 @@ export const AccountDetailPage = () => {
                 <select
                   className="input-control"
                   value={txType}
-                  onChange={(e) => setTxType(e.target.value)}
+                  onChange={(e) => {
+                    setTxType(e.target.value);
+                    setTxError('');
+                    setTxSuccess('');
+                  }}
                   disabled={txLoading}
                 >
                   <option value="deposit">Deposit Money</option>
                   <option value="withdrawal">Withdraw Money</option>
+                  <option value="transfer">Transfer Funds</option>
                 </select>
               </div>
+
+              {txType === 'transfer' && (
+                <div className="form-group flex-1">
+                  <label>Destination Account #</label>
+                  <input
+                    type="text"
+                    className="input-control"
+                    placeholder="e.g. 200987654321"
+                    value={destAccountNumber}
+                    onChange={(e) => setDestAccountNumber(e.target.value)}
+                    disabled={txLoading}
+                    required
+                  />
+                </div>
+              )}
 
               <div className="form-group flex-1">
                 <label>Amount (₹)</label>
@@ -207,7 +272,11 @@ export const AccountDetailPage = () => {
                 <input
                   type="text"
                   className="input-control"
-                  placeholder="e.g. Cash deposit, grocery payment"
+                  placeholder={
+                    txType === 'transfer'
+                      ? 'e.g. Rent transfer, bill split'
+                      : 'e.g. Cash deposit, grocery payment'
+                  }
                   value={txDesc}
                   onChange={(e) => setTxDesc(e.target.value)}
                   disabled={txLoading}
@@ -220,7 +289,13 @@ export const AccountDetailPage = () => {
                   className={`btn ${txType === 'deposit' ? 'btn-success' : 'btn-primary'} btn-block`}
                   disabled={txLoading}
                 >
-                  {txLoading ? 'Processing...' : txType === 'deposit' ? 'Confirm Deposit' : 'Confirm Withdrawal'}
+                  {txLoading
+                    ? 'Processing...'
+                    : txType === 'deposit'
+                    ? 'Confirm Deposit'
+                    : txType === 'withdrawal'
+                    ? 'Confirm Withdrawal'
+                    : 'Confirm Transfer'}
                 </button>
               </div>
             </div>
@@ -228,10 +303,10 @@ export const AccountDetailPage = () => {
         )}
       </div>
 
-      {/* Transaction Ledger Table (Issue #7) */}
+      {/* Transaction Ledger Table (Issue #7, #8) */}
       <div className="card transaction-ledger-card">
         <div className="card-header-simple">
-          <h3>Transaction History & Ledger (Issue #7)</h3>
+          <h3>Transaction History &amp; Ledger (Issue #7)</h3>
           <span className="badge-count">{transactions.length} record(s)</span>
         </div>
 
@@ -245,7 +320,7 @@ export const AccountDetailPage = () => {
               <thead>
                 <tr>
                   <th>Ref ID</th>
-                  <th>Date & Time</th>
+                  <th>Date &amp; Time</th>
                   <th>Type</th>
                   <th>Amount (₹)</th>
                   <th>Balance After (₹)</th>
@@ -253,26 +328,29 @@ export const AccountDetailPage = () => {
                 </tr>
               </thead>
               <tbody>
-                {transactions.map((t) => (
-                  <tr key={t.id}>
-                    <td><code>{t.reference_id}</code></td>
-                    <td><small>{t.created_at}</small></td>
-                    <td>
-                      <span className={`status-badge ${t.transaction_type === 'deposit' ? 'badge-active' : 'badge-closed'}`}>
-                        {t.transaction_type.toUpperCase()}
-                      </span>
-                    </td>
-                    <td>
-                      <strong className={t.transaction_type === 'deposit' ? 'text-success' : 'text-danger'}>
-                        {t.transaction_type === 'deposit' ? '+' : '-'}₹{parseFloat(t.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </strong>
-                    </td>
-                    <td>
-                      ₹{parseFloat(t.balance_after).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </td>
-                    <td>{t.description || '—'}</td>
-                  </tr>
-                ))}
+                {transactions.map((t) => {
+                  const isCredit = isCreditTransaction(t.transaction_type);
+                  return (
+                    <tr key={t.id}>
+                      <td><code>{t.reference_id}</code></td>
+                      <td><small>{t.created_at}</small></td>
+                      <td>
+                        <span className={`status-badge ${isCredit ? 'badge-active' : 'badge-closed'}`}>
+                          {formatTransactionTypeLabel(t.transaction_type)}
+                        </span>
+                      </td>
+                      <td>
+                        <strong className={isCredit ? 'text-success' : 'text-danger'}>
+                          {isCredit ? '+' : '-'}₹{parseFloat(t.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </strong>
+                      </td>
+                      <td>
+                        ₹{parseFloat(t.balance_after).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td>{t.description || '—'}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

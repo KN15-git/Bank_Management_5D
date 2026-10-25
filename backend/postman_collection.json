@@ -1,8 +1,8 @@
 {
   "info": {
-    "name": "PES Bank Management System API (Issues #2 - #7)",
+    "name": "PES Bank Management System API (Issues #2 - #9)",
     "_postman_id": "pes-bank-management-system",
-    "description": "Postman Collection for testing Issues #2 (Auth & Login), #3 (RBAC), #4 (Account & Balance Management), #5 (Deposit Money), #6 (Withdraw Money), and #7 (Transaction Validation & Recording).\n\nNOTE: When calling state-changing endpoints (POST/PATCH), Flask checks the X-CSRF-Token header. First call 'GET /api/auth/csrf' or 'POST /api/auth/login' to obtain the token, and set it in the header as X-CSRF-Token. Flask-Login uses the session cookie automatically if 'Automatically manage cookies' is enabled in Postman.",
+    "description": "Postman Collection for testing Issues #2 (Auth & Login), #3 (RBAC), #4 (Account & Balance Management), #5 (Deposit Money), #6 (Withdraw Money), #7 (Transaction Validation & Recording), #8 (Fund Transfer Between Accounts), and #9 (Atomic Transfer & Rollback).\n\nNOTE: When calling state-changing endpoints (POST/PATCH), Flask checks the X-CSRF-Token header. First call 'GET /api/auth/csrf' or 'POST /api/auth/login' to obtain the token, and set it in the header as X-CSRF-Token. Flask-Login uses the session cookie automatically if 'Automatically manage cookies' is enabled in Postman.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -203,6 +203,41 @@
           "host": ["127", "0", "0", "1"],
           "port": "5000",
           "path": ["api", "accounts", "1", "withdraw"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Fund Transfer (#8, #9)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-CSRF-Token", "value": "{{csrf_token}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"destination_account_number\": \"200987654321\",\n  \"amount\": \"1000.00\",\n  \"description\": \"Online Fund Transfer\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/transfer",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "transfer"]
+        }
+      }
+    },
+    {
+      "name": "Accounts - Get Transfer History (#8)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/api/accounts/1/transfers",
+          "protocol": "http",
+          "host": ["127", "0", "0", "1"],
+          "port": "5000",
+          "path": ["api", "accounts", "1", "transfers"]
         }
       }
     },
