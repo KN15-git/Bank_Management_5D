@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { apiRequest } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 
@@ -87,7 +88,7 @@ export const EmployeeDashboard = () => {
     <div className="dashboard-layout">
       <header className="page-header">
         <div>
-          <h1>Employee & Management Portal</h1>
+          <h1>Employee &amp; Management Portal</h1>
           <p className="subtitle">Account and Balance Administration &bull; Role: {user?.role.toUpperCase()}</p>
         </div>
         <button className="btn btn-primary" onClick={() => setShowCreateModal(true)}>
@@ -158,6 +159,9 @@ export const EmployeeDashboard = () => {
                   <td><span className={`status-badge badge-${acc.status}`}>{acc.status}</span></td>
                   <td>
                     <div className="action-buttons">
+                      <Link to={`/accounts/${acc.id}`} className="btn btn-outline btn-xs">
+                        View
+                      </Link>
                       {acc.status === 'active' && (
                         <button
                           className="btn btn-warning btn-xs"

@@ -7,6 +7,8 @@ Implements:
 - Issue #5: Deposit Money
 - Issue #6: Withdraw Money
 - Issue #7: Transaction Validation & Recording
+- Issue #8: Fund Transfer Between Accounts
+- Issue #9: Atomic Transfer & Rollback
 """
 import os
 import re
@@ -32,7 +34,7 @@ from flask_login import (
 load_dotenv()
 
 # ==============================================================================
-# 1. CONSTANTS & ENUMS (#3, #4, #5, #6, #7)
+# 1. CONSTANTS & ENUMS (#3, #4, #5, #6, #7, #8, #9)
 # ==============================================================================
 class Role(str, Enum):
     CUSTOMER = "customer"
@@ -58,6 +60,8 @@ class AccountType(str, Enum):
 class TransactionType(str, Enum):
     DEPOSIT = "deposit"
     WITHDRAWAL = "withdrawal"
+    TRANSFER_OUT = "transfer_out"
+    TRANSFER_IN = "transfer_in"
 
 
 # ==============================================================================
@@ -108,12 +112,44 @@ def close_db(e=None):
 
 
 def init_db(app=None):
-    """Initialize SQLite database using schema.sql."""
+    """Initialize SQLite database using schema.sql and migrate older schemas if needed."""
     def _run():
         db = get_db()
         schema_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
         with open(schema_file, "r", encoding="utf-8") as f:
             db.executescript(f.read())
+
+        # Migrate existing transactions table if it lacks transfer_out / transfer_in in CHECK constraint
+        cursor = db.cursor()
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'")
+        row = cursor.fetchone()
+        if row and row["sql"] and "transfer_out" not in row["sql"]:
+            db.execute("PRAGMA foreign_keys = OFF;")
+            db.executescript(
+                """
+                BEGIN TRANSACTION;
+                CREATE TABLE transactions_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reference_id TEXT UNIQUE NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('deposit', 'withdrawal', 'transfer_out', 'transfer_in')),
+                    amount INTEGER NOT NULL CHECK (amount > 0),
+                    balance_after INTEGER NOT NULL CHECK (balance_after >= 0),
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE RESTRICT
+                );
+                INSERT INTO transactions_new (id, reference_id, account_id, transaction_type, amount, balance_after, description, created_at)
+                SELECT id, reference_id, account_id, transaction_type, amount, balance_after, description, created_at FROM transactions;
+                DROP TABLE transactions;
+                ALTER TABLE transactions_new RENAME TO transactions;
+                CREATE INDEX IF NOT EXISTS idx_transactions_account_id ON transactions(account_id);
+                CREATE INDEX IF NOT EXISTS idx_transactions_reference_id ON transactions(reference_id);
+                COMMIT;
+                """
+            )
+            db.execute("PRAGMA foreign_keys = ON;")
+
         db.commit()
 
     if app:
@@ -426,7 +462,9 @@ def generate_transaction_reference() -> str:
         ref = f"TXN{secrets.token_hex(6).upper()}"
         cursor.execute("SELECT id FROM transactions WHERE reference_id = ?", (ref,))
         if not cursor.fetchone():
-            return ref
+            cursor.execute("SELECT id FROM transfers WHERE reference_id = ?", (ref,))
+            if not cursor.fetchone():
+                return ref
 
 
 def create_account(creator_user, user_id: int, account_type: str, initial_deposit_rupees: str = "0.00"):
@@ -620,7 +658,7 @@ def update_account_status(user, account_id: int, new_status: str):
 
 
 # ==============================================================================
-# 5B. FINANCIAL TRANSACTIONS SERVICES (#5, #6, #7)
+# 5B. FINANCIAL TRANSACTIONS SERVICES (#5, #6, #7, #8, #9)
 # ==============================================================================
 def execute_deposit(user, account_id: int, amount_rupees: str, description: str = None):
     """
@@ -781,6 +819,242 @@ def execute_withdrawal(user, account_id: int, amount_rupees: str, description: s
     }, None, 201
 
 
+def execute_transfer(
+    user,
+    source_account_id: int = None,
+    destination_account_number: str = None,
+    destination_account_id: int = None,
+    amount_rupees: str = None,
+    description: str = None,
+    source_account_number: str = None,
+    _simulate_failure_after_debit: bool = False,
+):
+    """
+    Issue #8: Fund Transfer Between Accounts.
+    Issue #9: Atomic Transfer & Rollback — ensures source debit, destination credit,
+    and transaction/transfer ledger records complete atomically or roll back completely.
+    """
+    if amount_rupees is None or str(amount_rupees).strip() == "":
+        return None, "Transfer amount is required", 400
+
+    try:
+        amount_paise = rupees_to_paise(amount_rupees)
+    except ValueError:
+        return None, "Invalid transfer amount format", 400
+
+    if amount_paise <= 0:
+        return None, "Enter a valid amount. Transfer amount must be greater than zero.", 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    # 1. Resolve and validate source account
+    if source_account_id is not None:
+        try:
+            source_account_id = int(source_account_id)
+        except (ValueError, TypeError):
+            return None, "Invalid source_account_id", 400
+        cursor.execute(
+            "SELECT id, account_number, user_id, balance, status FROM accounts WHERE id = ?",
+            (source_account_id,),
+        )
+    elif source_account_number:
+        cursor.execute(
+            "SELECT id, account_number, user_id, balance, status FROM accounts WHERE account_number = ?",
+            (str(source_account_number).strip(),),
+        )
+    else:
+        return None, "Source account is required", 400
+
+    source_acc = cursor.fetchone()
+    if not source_acc:
+        return None, "Source account not found", 404
+
+    can_access, err_code, err_msg = assert_can_access_account(user, source_acc)
+    if not can_access:
+        return None, err_msg, err_code
+
+    if source_acc["status"] == AccountStatus.FROZEN.value:
+        return None, "Source account is frozen. Transactions are temporarily suspended.", 403
+    if source_acc["status"] == AccountStatus.CLOSED.value:
+        return None, "Cannot perform transactions on a closed account.", 400
+
+    # 2. Resolve and validate destination account
+    dest_acc = None
+    if destination_account_number is not None and str(destination_account_number).strip() != "":
+        dest_num_clean = str(destination_account_number).strip()
+        cursor.execute(
+            "SELECT id, account_number, user_id, balance, status FROM accounts WHERE account_number = ?",
+            (dest_num_clean,),
+        )
+        dest_acc = cursor.fetchone()
+    elif destination_account_id is not None and str(destination_account_id).strip() != "":
+        try:
+            dest_id_int = int(destination_account_id)
+        except (ValueError, TypeError):
+            return None, "Invalid destination_account_id", 400
+        cursor.execute(
+            "SELECT id, account_number, user_id, balance, status FROM accounts WHERE id = ?",
+            (dest_id_int,),
+        )
+        dest_acc = cursor.fetchone()
+    else:
+        return None, "Destination account number or ID is required", 400
+
+    if not dest_acc:
+        return None, "Destination account not found", 404
+
+    if source_acc["id"] == dest_acc["id"]:
+        return None, "Cannot transfer funds to the same account.", 400
+
+    if dest_acc["status"] == AccountStatus.FROZEN.value:
+        return None, "Destination account is frozen. Cannot receive transfers.", 403
+    if dest_acc["status"] == AccountStatus.CLOSED.value:
+        return None, "Cannot transfer funds to a closed destination account.", 400
+
+    # 3. Validate sufficient funds in source account
+    if source_acc["balance"] < amount_paise:
+        return (
+            None,
+            f"Insufficient funds. Available balance: ₹{paise_to_rupees_str(source_acc['balance'])}, Requested: ₹{paise_to_rupees_str(amount_paise)}",
+            400,
+        )
+
+    new_source_balance = source_acc["balance"] - amount_paise
+    new_dest_balance = dest_acc["balance"] + amount_paise
+    transfer_ref = generate_transaction_reference()
+    debit_ref = f"{transfer_ref}-DR"
+    credit_ref = f"{transfer_ref}-CR"
+
+    clean_desc = (description or "").strip()
+    debit_desc = f"Transfer to A/C {dest_acc['account_number']}" + (f" - {clean_desc}" if clean_desc else "")
+    credit_desc = f"Transfer from A/C {source_acc['account_number']}" + (f" - {clean_desc}" if clean_desc else "")
+    transfer_desc = clean_desc or f"Transfer from {source_acc['account_number']} to {dest_acc['account_number']}"
+
+    # 4. Atomic execution of debit, credit, and ledger entries (#9)
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+
+        # Step A: Debit source account
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (new_source_balance, source_acc["id"]),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Failed to update source account balance")
+
+        if _simulate_failure_after_debit:
+            raise RuntimeError("Simulated mid-transfer failure after debiting source account")
+
+        # Step B: Credit destination account
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (new_dest_balance, dest_acc["id"]),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Failed to update destination account balance")
+
+        # Step C: Insert debit transaction record for source account
+        cursor.execute(
+            """
+            INSERT INTO transactions (reference_id, account_id, transaction_type, amount, balance_after, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                debit_ref,
+                source_acc["id"],
+                TransactionType.TRANSFER_OUT.value,
+                amount_paise,
+                new_source_balance,
+                debit_desc,
+            ),
+        )
+        debit_txn_id = cursor.lastrowid
+
+        # Step D: Insert credit transaction record for destination account
+        cursor.execute(
+            """
+            INSERT INTO transactions (reference_id, account_id, transaction_type, amount, balance_after, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                credit_ref,
+                dest_acc["id"],
+                TransactionType.TRANSFER_IN.value,
+                amount_paise,
+                new_dest_balance,
+                credit_desc,
+            ),
+        )
+        credit_txn_id = cursor.lastrowid
+
+        # Step E: Insert transfer record into transfers table
+        cursor.execute(
+            """
+            INSERT INTO transfers (
+                reference_id, source_account_id, destination_account_id,
+                amount, source_balance_after, destination_balance_after, description
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer_ref,
+                source_acc["id"],
+                dest_acc["id"],
+                amount_paise,
+                new_source_balance,
+                new_dest_balance,
+                transfer_desc,
+            ),
+        )
+        transfer_id = cursor.lastrowid
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        try:
+            log_event(
+                "TRANSFER_ROLLED_BACK",
+                user_id=user.id,
+                details=f"Rolled back transfer of ₹{paise_to_rupees_str(amount_paise)} from {source_acc['account_number']} to {dest_acc['account_number']}: {str(e)}",
+            )
+        except Exception:
+            pass
+        return None, f"Transfer failed and was rolled back: {str(e)}", 500
+
+    log_event(
+        "TRANSFER_PROCESSED",
+        user_id=user.id,
+        details=f"Transferred ₹{paise_to_rupees_str(amount_paise)} from {source_acc['account_number']} to {dest_acc['account_number']} (Ref: {transfer_ref})",
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    transfer_payload = {
+        "transfer_id": transfer_id,
+        "debit_transaction_id": debit_txn_id,
+        "credit_transaction_id": credit_txn_id,
+        "reference_id": transfer_ref,
+        "debit_reference_id": debit_ref,
+        "credit_reference_id": credit_ref,
+        "source_account_id": source_acc["id"],
+        "source_account_number": source_acc["account_number"],
+        "destination_account_id": dest_acc["id"],
+        "destination_account_number": dest_acc["account_number"],
+        "amount": paise_to_rupees_str(amount_paise),
+        "amount_paise": amount_paise,
+        "source_balance_after": paise_to_rupees_str(new_source_balance),
+        "source_balance_after_paise": new_source_balance,
+        "destination_balance_after": paise_to_rupees_str(new_dest_balance),
+        "destination_balance_after_paise": new_dest_balance,
+        "balance_after": paise_to_rupees_str(new_source_balance),
+        "balance_after_paise": new_source_balance,
+        "transaction_type": TransactionType.TRANSFER_OUT.value,
+        "description": transfer_desc,
+        "created_at": now_iso,
+    }
+    return transfer_payload, None, 201
+
+
 def get_account_transactions(user, account_id: int):
     """
     Issue #7: Retrieve transaction history for an account.
@@ -828,12 +1102,69 @@ def get_account_transactions(user, account_id: int):
     return txns, None, 200
 
 
+def get_account_transfers(user, account_id: int):
+    """
+    Issue #8: Retrieve fund transfers involving an account (as source or destination).
+    """
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT id, account_number, user_id FROM accounts WHERE id = ?",
+        (account_id,),
+    )
+    acc = cursor.fetchone()
+    if not acc:
+        return None, "Account not found", 404
+
+    can_access, err_code, err_msg = assert_can_access_account(user, acc)
+    if not can_access:
+        return None, err_msg, err_code
+
+    cursor.execute(
+        """
+        SELECT t.id, t.reference_id, t.source_account_id, s.account_number AS source_account_number,
+               t.destination_account_id, d.account_number AS destination_account_number,
+               t.amount, t.source_balance_after, t.destination_balance_after,
+               t.description, t.created_at
+        FROM transfers t
+        JOIN accounts s ON t.source_account_id = s.id
+        JOIN accounts d ON t.destination_account_id = d.id
+        WHERE t.source_account_id = ? OR t.destination_account_id = ?
+        ORDER BY t.id DESC
+        """,
+        (account_id, account_id),
+    )
+    rows = cursor.fetchall()
+    transfers = [
+        {
+            "id": r["id"],
+            "reference_id": r["reference_id"],
+            "source_account_id": r["source_account_id"],
+            "source_account_number": r["source_account_number"],
+            "destination_account_id": r["destination_account_id"],
+            "destination_account_number": r["destination_account_number"],
+            "direction": "outgoing" if r["source_account_id"] == account_id else "incoming",
+            "amount_paise": r["amount"],
+            "amount": paise_to_rupees_str(r["amount"]),
+            "source_balance_after_paise": r["source_balance_after"],
+            "source_balance_after": paise_to_rupees_str(r["source_balance_after"]),
+            "destination_balance_after_paise": r["destination_balance_after"],
+            "destination_balance_after": paise_to_rupees_str(r["destination_balance_after"]),
+            "description": r["description"],
+            "created_at": str(r["created_at"]),
+        }
+        for r in rows
+    ]
+    return transfers, None, 200
+
+
 # ==============================================================================
 # 6. BLUEPRINT ROUTES
 # ==============================================================================
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 user_bp = Blueprint("users", __name__, url_prefix="/api/users")
 account_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
+transfer_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
 
 
 # --- Auth Endpoints (#2) ---
@@ -957,7 +1288,7 @@ def change_user_status(user_id):
     return jsonify({"message": "User status updated successfully", "user": {"id": user_id, "is_active": is_active}}), 200
 
 
-# --- Account & Financial Transactions Endpoints (#4, #5, #6, #7) ---
+# --- Account & Financial Transactions Endpoints (#4, #5, #6, #7, #8, #9) ---
 @account_bp.route("", methods=["POST"])
 @login_required
 def open_account():
@@ -1052,6 +1383,88 @@ def withdraw_from_account(account_id):
     return jsonify({"message": "Withdrawal successful", "transaction": txn}), 201
 
 
+@account_bp.route("/<int:account_id>/transfer", methods=["POST"])
+@login_required
+def transfer_from_account(account_id):
+    """Issue #8 & #9: Atomic fund transfer from source account_id to destination account."""
+    data = request.get_json(silent=True) or {}
+    dest_acc_num = (
+        data.get("destination_account_number")
+        or data.get("to_account_number")
+        or data.get("target_account_number")
+        or data.get("destination_account")
+    )
+    dest_acc_id = (
+        data.get("destination_account_id")
+        or data.get("to_account_id")
+        or data.get("target_account_id")
+    )
+    amount = data.get("amount")
+    description = data.get("description")
+
+    transfer_res, err, code = execute_transfer(
+        user=current_user,
+        source_account_id=account_id,
+        destination_account_number=dest_acc_num,
+        destination_account_id=dest_acc_id,
+        amount_rupees=amount,
+        description=description,
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Transfer successful", "transfer": transfer_res, "transaction": transfer_res}), 201
+
+
+@account_bp.route("/transfer", methods=["POST"])
+@transfer_bp.route("", methods=["POST"])
+@login_required
+def initiate_transfer():
+    """Issue #8 & #9: Top-level atomic fund transfer endpoint."""
+    data = request.get_json(silent=True) or {}
+    src_acc_id = data.get("source_account_id") or data.get("from_account_id")
+    src_acc_num = (
+        data.get("source_account_number")
+        or data.get("from_account_number")
+        or data.get("source_account")
+    )
+    dest_acc_num = (
+        data.get("destination_account_number")
+        or data.get("to_account_number")
+        or data.get("target_account_number")
+        or data.get("destination_account")
+    )
+    dest_acc_id = (
+        data.get("destination_account_id")
+        or data.get("to_account_id")
+        or data.get("target_account_id")
+    )
+    amount = data.get("amount")
+    description = data.get("description")
+
+    transfer_res, err, code = execute_transfer(
+        user=current_user,
+        source_account_id=src_acc_id,
+        source_account_number=src_acc_num,
+        destination_account_number=dest_acc_num,
+        destination_account_id=dest_acc_id,
+        amount_rupees=amount,
+        description=description,
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Transfer successful", "transfer": transfer_res, "transaction": transfer_res}), 201
+
+
+@account_bp.route("/<int:account_id>/transfers", methods=["GET"])
+@login_required
+def list_account_transfers(account_id):
+    """Issue #8: Get transfer records involving an account."""
+    transfers, err, code = get_account_transfers(current_user, account_id)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"transfers": transfers}), 200
+
+
 @account_bp.route("/<int:account_id>/transactions", methods=["GET"])
 @login_required
 def list_account_txns(account_id):
@@ -1107,6 +1520,7 @@ def create_app(custom_config=None):
     app.register_blueprint(auth_bp)
     app.register_blueprint(user_bp)
     app.register_blueprint(account_bp)
+    app.register_blueprint(transfer_bp)
 
     @app.errorhandler(400)
     def err_bad_req(e):
