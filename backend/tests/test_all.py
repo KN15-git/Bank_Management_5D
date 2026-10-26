@@ -6,9 +6,21 @@ Automated pytest suite for Bank Management System:
 - Issue #5: Deposit Money
 - Issue #6: Withdraw Money
 - Issue #7: Transaction Validation & Recording
+- Issue #8: Fund Transfer Between Accounts
+- Issue #9: Atomic Transfer & Rollback
 """
 import pytest
-from app import create_app, init_db, get_db, Role, AccountStatus, AccountType, hash_password
+from app import (
+    create_app,
+    init_db,
+    get_db,
+    get_user_by_id,
+    execute_transfer,
+    Role,
+    AccountStatus,
+    AccountType,
+    hash_password,
+)
 
 
 @pytest.fixture
@@ -451,6 +463,271 @@ def test_audit_log_entries_created(client):
 
 
 # ==============================================================================
+# ISSUE #8 & #9: FUND TRANSFER & ATOMIC ROLLBACK TESTS
+# ==============================================================================
+def test_transfer_between_own_accounts_success(client):
+    """Issue #8: Customer transfers funds between their own active accounts."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # Account 1 has ₹1500.00; Account 2 has ₹0.00. Transfer ₹450.25 from Account 1 to Account 2.
+    res = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "destination_account_number": "100000000002",
+            "amount": "450.25",
+            "description": "Savings to Current transfer",
+        },
+    )
+    assert res.status_code == 201
+    data = res.get_json()
+    trf = data["transfer"]
+    assert trf["amount"] == "450.25"
+    assert trf["amount_paise"] == 45025
+    assert trf["source_account_number"] == "100000000001"
+    assert trf["destination_account_number"] == "100000000002"
+    assert trf["source_balance_after"] == "1049.75"
+    assert trf["destination_balance_after"] == "450.25"
+    assert trf["reference_id"].startswith("TXN")
+
+    # Verify both balances updated accurately
+    bal1 = client.get("/api/accounts/1/balance").get_json()
+    bal2 = client.get("/api/accounts/2/balance").get_json()
+    assert bal1["balance"] == "1049.75"
+    assert bal1["balance_paise"] == 104975
+    assert bal2["balance"] == "450.25"
+    assert bal2["balance_paise"] == 45025
+
+    # Verify ledger entries created on both accounts
+    txns1 = client.get("/api/accounts/1/transactions").get_json()["transactions"]
+    txns2 = client.get("/api/accounts/2/transactions").get_json()["transactions"]
+    assert len(txns1) == 1
+    assert txns1[0]["transaction_type"] == "transfer_out"
+    assert txns1[0]["amount"] == "450.25"
+    assert txns1[0]["balance_after"] == "1049.75"
+
+    assert len(txns2) == 1
+    assert txns2[0]["transaction_type"] == "transfer_in"
+    assert txns2[0]["amount"] == "450.25"
+    assert txns2[0]["balance_after"] == "450.25"
+
+
+def test_transfer_to_another_customer_account_and_transfer_history(client):
+    """Issue #8: Customer transfers funds to another customer's account and views transfer list."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # Account 1 (cust1, ₹1500.00) -> Account 3 (cust2, 200000000001, ₹5000.00), amount ₹500.00
+    res = client.post(
+        "/api/transfers",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "source_account_id": 1,
+            "destination_account_number": "200000000001",
+            "amount": "500.00",
+            "description": "Rent payment to cust2",
+        },
+    )
+    assert res.status_code == 201
+    trf = res.get_json()["transfer"]
+    assert trf["source_balance_after"] == "1000.00"
+    assert trf["destination_balance_after"] == "5500.00"
+
+    # Check transfer history on source account
+    trf_list_res = client.get("/api/accounts/1/transfers")
+    assert trf_list_res.status_code == 200
+    transfers = trf_list_res.get_json()["transfers"]
+    assert len(transfers) == 1
+    assert transfers[0]["direction"] == "outgoing"
+    assert transfers[0]["amount"] == "500.00"
+
+    # Login as cust2 and verify their balance and incoming transfer record
+    client.post("/api/auth/login", json={"username": "cust2", "password": "CustPass2"})
+    bal3 = client.get("/api/accounts/3/balance").get_json()
+    assert bal3["balance"] == "5500.00"
+
+    trf_list_cust2 = client.get("/api/accounts/3/transfers").get_json()["transfers"]
+    assert len(trf_list_cust2) == 1
+    assert trf_list_cust2[0]["direction"] == "incoming"
+
+
+def test_transfer_insufficient_funds_rejected_and_atomic(client):
+    """Issue #8 & #9: Transfer exceeding balance is rejected and neither account changes."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    res = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "destination_account_number": "200000000001",
+            "amount": "2000.00",
+        },
+    )
+    assert res.status_code == 400
+    assert "Insufficient funds" in res.get_json()["error"]
+
+    # Source account still ₹1500.00 and no transactions recorded
+    assert client.get("/api/accounts/1/balance").get_json()["balance"] == "1500.00"
+    assert len(client.get("/api/accounts/1/transactions").get_json()["transactions"]) == 0
+
+
+def test_transfer_validation_errors(client):
+    """Issue #8: Validate self-transfer, non-existent destination, zero/negative amounts, and unauthorized source."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # 1. Self-transfer rejected
+    res_same = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "100000000001", "amount": "100.00"},
+    )
+    assert res_same.status_code == 400
+    assert "same account" in res_same.get_json()["error"]
+
+    # 2. Non-existent destination account -> 404
+    res_missing = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "999999999999", "amount": "100.00"},
+    )
+    assert res_missing.status_code == 404
+    assert "Destination account not found" in res_missing.get_json()["error"]
+
+    # 3. Zero or negative amount -> 400
+    res_zero = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "200000000001", "amount": "0.00"},
+    )
+    assert res_zero.status_code == 400
+    assert "greater than zero" in res_zero.get_json()["error"]
+
+    res_neg = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "200000000001", "amount": "-50.00"},
+    )
+    assert res_neg.status_code == 400
+
+    # 4. Unauthorized transfer from another customer's account -> 403
+    res_unauth = client.post(
+        "/api/accounts/3/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "100000000001", "amount": "50.00"},
+    )
+    assert res_unauth.status_code == 403
+    assert "do not own this account" in res_unauth.get_json()["error"]
+
+
+def test_transfer_frozen_or_closed_accounts_rejected(client):
+    """Issue #8: Transfers from or to frozen or closed accounts are blocked."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # 1. Source account 4 is frozen -> 403
+    res_src_frozen = client.post(
+        "/api/accounts/4/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "100000000001", "amount": "100.00"},
+    )
+    assert res_src_frozen.status_code == 403
+    assert "frozen" in res_src_frozen.get_json()["error"]
+
+    # 2. Destination account 4 is frozen -> 403
+    res_dest_frozen = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "100000000003", "amount": "100.00"},
+    )
+    assert res_dest_frozen.status_code == 403
+    assert "frozen" in res_dest_frozen.get_json()["error"]
+
+    # 3. Close zero-balance account 2 as employee, then attempt transfer to it -> 400
+    client.post("/api/auth/login", json={"username": "emp1", "password": "EmpPass1"})
+    emp_csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    client.patch(
+        "/api/accounts/2/status",
+        headers={"X-CSRF-Token": emp_csrf},
+        json={"status": "closed"},
+    )
+
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    cust_csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    res_dest_closed = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": cust_csrf},
+        json={"destination_account_number": "100000000002", "amount": "100.00"},
+    )
+    assert res_dest_closed.status_code == 400
+    assert "closed" in res_dest_closed.get_json()["error"]
+
+
+def test_atomic_transfer_rollback_on_mid_transaction_failure(client):
+    """
+    Issue #9: Verify all-or-nothing atomicity.
+    If an error occurs after the source account is debited (or during ledger recording),
+    the entire transaction rolls back so source balance is never debited without destination credit.
+    """
+    app = client.application
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cust1 = get_user_by_id(3)
+
+        # Case A: Simulated failure right after debiting source account
+        res, err, code = execute_transfer(
+            user=cust1,
+            source_account_id=1,
+            destination_account_number="200000000001",
+            amount_rupees="400.00",
+            description="Should rollback",
+            _simulate_failure_after_debit=True,
+        )
+        assert res is None
+        assert code == 500
+        assert "rolled back" in err
+
+        # Verify source account 1 still has 150000 paise (₹1500.00) and destination account 3 still has 500000 paise (₹5000.00)
+        cursor.execute("SELECT balance FROM accounts WHERE id = 1")
+        assert cursor.fetchone()["balance"] == 150000
+        cursor.execute("SELECT balance FROM accounts WHERE id = 3")
+        assert cursor.fetchone()["balance"] == 500000
+
+        # Verify no partial rows exist in transactions or transfers
+        cursor.execute("SELECT COUNT(*) AS cnt FROM transactions")
+        assert cursor.fetchone()["cnt"] == 0
+        cursor.execute("SELECT COUNT(*) AS cnt FROM transfers")
+        assert cursor.fetchone()["cnt"] == 0
+
+        # Case B: Database trigger failure during credit / ledger insertion via HTTP endpoint
+        cursor.execute(
+            """
+            CREATE TRIGGER fail_on_transfer_insert
+            BEFORE INSERT ON transfers
+            BEGIN
+                SELECT RAISE(ABORT, 'Database ledger failure during transfer');
+            END;
+            """
+        )
+        db.commit()
+
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    http_res = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf},
+        json={"destination_account_number": "200000000001", "amount": "300.00"},
+    )
+    assert http_res.status_code == 500
+    assert "rolled back" in http_res.get_json()["error"]
+
+    # Both balances and transaction ledgers must remain completely unchanged
+    assert client.get("/api/accounts/1/balance").get_json()["balance"] == "1500.00"
+    assert len(client.get("/api/accounts/1/transactions").get_json()["transactions"]) == 0
+
 # ISSUE #19: DATA SECURITY & ROLE ACCESS TESTS
 # ==============================================================================
 def test_issue_19_security_headers_and_cache_control(client):
