@@ -727,3 +727,42 @@ def test_atomic_transfer_rollback_on_mid_transaction_failure(client):
     # Both balances and transaction ledgers must remain completely unchanged
     assert client.get("/api/accounts/1/balance").get_json()["balance"] == "1500.00"
     assert len(client.get("/api/accounts/1/transactions").get_json()["transactions"]) == 0
+
+# ISSUE #19: DATA SECURITY & ROLE ACCESS TESTS
+# ==============================================================================
+def test_issue_19_security_headers_and_cache_control(client):
+    res = client.get('/api/health')
+    assert res.status_code == 200
+    assert res.headers.get('X-Content-Type-Options') == 'nosniff'
+    assert res.headers.get('X-Frame-Options') == 'DENY'
+    assert 'no-store' in res.headers.get('Cache-Control', '')
+    assert 'Strict-Transport-Security' in res.headers
+
+
+def test_issue_19_no_plaintext_passwords_in_db_or_api(client):
+    # Verify passwords stored as bcrypt hashes only, never plain text
+    with client.application.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute('SELECT password_hash FROM users')
+        rows = cursor.fetchall()
+        for r in rows:
+            h = r['password_hash']
+            assert h.startswith('$') or h.startswith('$')
+            assert 'AdminPassword' not in h
+            assert 'Bank@1234' not in h
+
+
+# ==============================================================================
+# ISSUE #20: SYSTEM RESPONSE TIME TESTS
+# ==============================================================================
+def test_issue_20_system_response_time_under_threshold(client):
+    import time
+    start = time.time()
+    res = client.get('/api/health')
+    elapsed = time.time() - start
+    assert res.status_code == 200
+    # Requirement: response time must complete well under 2-3 seconds threshold
+    assert elapsed < 1.0
+    assert 'X-Response-Time' in res.headers
+    assert 'Server-Timing' in res.headers

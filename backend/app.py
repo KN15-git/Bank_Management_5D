@@ -1,3 +1,4 @@
+import time
 """
 PES University Bank Management System - Flask REST API Backend
 Implements:
@@ -1510,8 +1511,28 @@ def create_app(custom_config=None):
         return jsonify({"error": "Authentication required"}), 401
 
     @app.before_request
+    def start_timer():
+        g.start_time = time.time()
+
+    @app.before_request
     def check_csrf():
         return verify_csrf_token()
+
+    @app.after_request
+    def apply_security_headers_and_timing(response):
+        # Issue #19: Security Headers & Role Data Protection
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+
+        # Issue #20: System Response Time tracking (Server-Timing & X-Response-Time in ms)
+        if hasattr(g, 'start_time'):
+            elapsed_ms = (time.time() - g.start_time) * 1000
+            response.headers['Server-Timing'] = f'total;dur={elapsed_ms:.2f}'
+            response.headers['X-Response-Time'] = f'{elapsed_ms:.2f}ms'
+        return response
 
     @app.route("/api/health", methods=["GET"])
     def health():
