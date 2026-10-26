@@ -8,12 +8,16 @@ Automated pytest suite for Bank Management System:
 - Issue #7: Transaction Validation & Recording
 - Issue #8: Fund Transfer Between Accounts
 - Issue #9: Atomic Transfer & Rollback
+- Issue #19: Data Security and Role Access
+- Issue #20: System Response Time
+- Issue #21: System Availability and Reliability
 """
 import pytest
 from app import (
     create_app,
     init_db,
     get_db,
+    close_db,
     get_user_by_id,
     execute_transfer,
     Role,
@@ -728,6 +732,8 @@ def test_atomic_transfer_rollback_on_mid_transaction_failure(client):
     assert client.get("/api/accounts/1/balance").get_json()["balance"] == "1500.00"
     assert len(client.get("/api/accounts/1/transactions").get_json()["transactions"]) == 0
 
+
+# ==============================================================================
 # ISSUE #19: DATA SECURITY & ROLE ACCESS TESTS
 # ==============================================================================
 def test_issue_19_security_headers_and_cache_control(client):
@@ -766,3 +772,110 @@ def test_issue_20_system_response_time_under_threshold(client):
     assert elapsed < 1.0
     assert 'X-Response-Time' in res.headers
     assert 'Server-Timing' in res.headers
+
+
+# ==============================================================================
+# ISSUE #21: SYSTEM AVAILABILITY AND RELIABILITY TESTS
+# ==============================================================================
+def test_issue_21_health_and_readiness_diagnostics(client):
+    """Issue #21: Verify liveness and readiness probes report DB connectivity, schema integrity, and uptime."""
+    for endpoint in ("/api/health", "/api/health/ready"):
+        res = client.get(endpoint)
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["status"] == "healthy"
+        assert data["service"] == "Bank Management System API"
+        assert data["db_connected"] is True
+        assert data["integrity"] == "ok"
+        assert isinstance(data["uptime_seconds"], (int, float))
+        assert data["uptime_seconds"] >= 0
+
+
+def test_issue_21_graceful_degradation_and_recovery_on_db_failure(client, monkeypatch):
+    """
+    Issue #21: When the database encounters an operational failure, health checks and endpoints
+    degrade gracefully with structured 503 JSON instead of crashing, and recover automatically.
+    """
+    import sqlite3
+    import app as app_module
+
+    def broken_get_db():
+        raise sqlite3.OperationalError("simulated database connection failure")
+
+    monkeypatch.setattr(app_module, "get_db", broken_get_db)
+
+    res_degraded = client.get("/api/health")
+    assert res_degraded.status_code == 503
+    data_degraded = res_degraded.get_json()
+    assert data_degraded["status"] == "unhealthy"
+    assert data_degraded["db_connected"] is False
+    assert "Database unavailable" in data_degraded["error"]
+
+    # Restore database connection helper and verify immediate self-healing recovery
+    monkeypatch.undo()
+    res_recovered = client.get("/api/health")
+    assert res_recovered.status_code == 200
+    assert res_recovered.get_json()["status"] == "healthy"
+    assert res_recovered.get_json()["db_connected"] is True
+
+
+def test_issue_21_teardown_rollback_and_fault_isolation(client):
+    """
+    Issue #21: Verify uncommitted changes are automatically rolled back if an unhandled exception
+    occurs during request teardown, preserving data consistency for subsequent requests.
+    """
+    app = client.application
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("UPDATE accounts SET balance = 999999 WHERE id = 1")
+        # Simulate an unhandled exception passed into close_db teardown
+        close_db(RuntimeError("Simulated unhandled request error"))
+
+    # Subsequent request should see the original committed balance (₹1500.00 / 150000 paise)
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    bal_res = client.get("/api/accounts/1/balance")
+    assert bal_res.status_code == 200
+    assert bal_res.get_json()["balance"] == "1500.00"
+    assert bal_res.get_json()["balance_paise"] == 150000
+
+
+def test_issue_21_sustained_load_availability_and_consistency(client):
+    """
+    Issue #21: Verify 100% system availability and financial consistency across a burst of
+    valid and invalid operations (interleaving deposits, failed overdrafts, transfers, and health checks).
+    """
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # Execute 10 interleaved cycles of valid deposits, invalid overdraft attempts, and valid transfers
+    for _ in range(10):
+        dep_res = client.post(
+            "/api/accounts/1/deposit",
+            headers={"X-CSRF-Token": csrf},
+            json={"amount": "100.00", "description": "Load test deposit"},
+        )
+        assert dep_res.status_code == 201
+
+        # Invalid overdraft attempt in the middle of valid traffic must fail cleanly without corrupting state
+        bad_wdr = client.post(
+            "/api/accounts/1/withdraw",
+            headers={"X-CSRF-Token": csrf},
+            json={"amount": "999999.00"},
+        )
+        assert bad_wdr.status_code == 400
+
+        trf_res = client.post(
+            "/api/accounts/1/transfer",
+            headers={"X-CSRF-Token": csrf},
+            json={"destination_account_number": "100000000002", "amount": "40.00"},
+        )
+        assert trf_res.status_code == 201
+
+        health_res = client.get("/api/health")
+        assert health_res.status_code == 200
+
+    # Initial: Acc 1 = ₹1500.00, Acc 2 = ₹0.00
+    # After 10 cycles of (+100.00 - 40.00): Acc 1 = ₹2100.00, Acc 2 = ₹400.00
+    assert client.get("/api/accounts/1/balance").get_json()["balance"] == "2100.00"
+    assert client.get("/api/accounts/2/balance").get_json()["balance"] == "400.00"

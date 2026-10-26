@@ -10,6 +10,9 @@ Implements:
 - Issue #7: Transaction Validation & Recording
 - Issue #8: Fund Transfer Between Accounts
 - Issue #9: Atomic Transfer & Rollback
+- Issue #19: Data Security and Role Access
+- Issue #20: System Response Time
+- Issue #21: System Availability and Reliability
 """
 import os
 import re
@@ -33,6 +36,8 @@ from flask_login import (
 )
 
 load_dotenv()
+
+APP_START_TIME = time.time()
 
 # ==============================================================================
 # 1. CONSTANTS & ENUMS (#3, #4, #5, #6, #7, #8, #9)
@@ -93,23 +98,74 @@ class User(UserMixin):
 
 
 def get_db():
-    """Return a per-request SQLite connection with foreign keys enabled."""
+    """Return a per-request SQLite connection with foreign keys and lock resilience enabled (#21)."""
     if "db" not in g:
         db_path = current_app.config.get("DATABASE_PATH", "bank.db")
         g.db = sqlite3.connect(
             db_path,
+            timeout=10.0,
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         )
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA busy_timeout = 5000;")
         g.db.execute("PRAGMA foreign_keys = ON;")
     return g.db
 
 
 def close_db(e=None):
-    """Close the database connection at the end of the request."""
+    """Close the database connection at the end of the request, rolling back on unhandled errors (#21)."""
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        if e is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def check_system_health():
+    """
+    Issue #21: System Availability and Reliability health & readiness probe.
+    Verifies live database connectivity and SQLite quick integrity check.
+    """
+    uptime_sec = round(max(0.0, time.time() - APP_START_TIME), 2)
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.execute("PRAGMA quick_check")
+        integrity_row = cursor.fetchone()
+        integrity_status = integrity_row[0] if integrity_row else "unknown"
+        if integrity_status != "ok":
+            return {
+                "status": "unhealthy",
+                "service": "Bank Management System API",
+                "db_connected": True,
+                "integrity": integrity_status,
+                "uptime_seconds": uptime_sec,
+                "error": "Database integrity check failed",
+            }, 503
+        return {
+            "status": "healthy",
+            "service": "Bank Management System API",
+            "db_connected": True,
+            "integrity": "ok",
+            "uptime_seconds": uptime_sec,
+        }, 200
+    except Exception as exc:
+        return {
+            "status": "unhealthy",
+            "service": "Bank Management System API",
+            "db_connected": False,
+            "integrity": "failed",
+            "uptime_seconds": uptime_sec,
+            "error": f"Database unavailable: {str(exc)}",
+        }, 503
 
 
 def init_db(app=None):
@@ -164,19 +220,23 @@ def init_db(app=None):
 # 3. AUDIT & SECURITY UTILITIES
 # ==============================================================================
 def log_event(action: str, user_id=None, details: str = None, ip_address: str = None):
-    """Record security and account lifecycle events to audit_logs."""
+    """Record security and account lifecycle events to audit_logs with fault isolation (#21)."""
     if ip_address is None:
         try:
             ip_address = request.remote_addr
         except RuntimeError:
             ip_address = "system"
 
-    db = get_db()
-    db.execute(
-        "INSERT INTO audit_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)",
-        (user_id, action, details, ip_address),
-    )
-    db.commit()
+    try:
+        db = get_db()
+        db.execute(
+            "INSERT INTO audit_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)",
+            (user_id, action, details, ip_address),
+        )
+        db.commit()
+    except Exception:
+        # Fault isolation (#21): prevent non-critical logging errors from crashing active requests
+        pass
 
 
 def hash_password(password: str) -> str:
@@ -1504,7 +1564,10 @@ def create_app(custom_config=None):
 
     @login_manager.user_loader
     def load_user(user_id):
-        return get_user_by_id(int(user_id))
+        try:
+            return get_user_by_id(int(user_id))
+        except Exception:
+            return None
 
     @login_manager.unauthorized_handler
     def unauthorized():
@@ -1535,13 +1598,27 @@ def create_app(custom_config=None):
         return response
 
     @app.route("/api/health", methods=["GET"])
+    @app.route("/api/health/ready", methods=["GET"])
     def health():
-        return jsonify({"status": "healthy", "service": "Bank Management System API"}), 200
+        # Issue #21: System Availability & Readiness Probe with DB verification
+        payload, status_code = check_system_health()
+        return jsonify(payload), status_code
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(user_bp)
     app.register_blueprint(account_bp)
     app.register_blueprint(transfer_bp)
+
+    @app.errorhandler(sqlite3.Error)
+    def err_database(e):
+        # Issue #21: Roll back active transaction and return structured JSON on unexpected DB errors
+        db = g.get("db", None)
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        return jsonify({"error": "Database service error", "status": "error"}), 503
 
     @app.errorhandler(400)
     def err_bad_req(e):
@@ -1559,8 +1636,22 @@ def create_app(custom_config=None):
     def err_not_found(e):
         return jsonify({"error": "Requested resource not found"}), 404
 
+    @app.errorhandler(405)
+    def err_method_not_allowed(e):
+        return jsonify({"error": "Method not allowed"}), 405
+
+    @app.errorhandler(503)
+    def err_service_unavailable(e):
+        return jsonify({"error": "Service temporarily unavailable"}), 503
+
     @app.errorhandler(500)
     def err_server(e):
+        db = g.get("db", None)
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return jsonify({"error": "Internal server error"}), 500
 
     return app
