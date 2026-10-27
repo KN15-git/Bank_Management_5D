@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { apiRequest } from '../services/api';
 import { useAuth } from '../context/AuthContext';
@@ -11,6 +11,30 @@ export const AccountDetailPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+
+  // Transaction history filters, pagination, and export (Issues #13-#15).
+  const [filters, setFilters] = useState({
+    type: '', search: '', date_from: '', date_to: '', sort_by: 'date', sort_order: 'desc',
+  });
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(10);
+  const [pagination, setPagination] = useState({
+    page: 1, per_page: 10, total: 0, total_pages: 0, has_next: false, has_previous: false,
+  });
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
+
+  const transactionQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    params.set('page', String(page));
+    params.set('per_page', String(perPage));
+    return params.toString();
+  }, [filters, page, perPage]);
+
   // Transaction form states
   const [txType, setTxType] = useState('deposit');
   const [txAmount, setTxAmount] = useState('');
@@ -20,26 +44,49 @@ export const AccountDetailPage = () => {
   const [txSuccess, setTxSuccess] = useState('');
   const [txError, setTxError] = useState('');
 
-  const fetchDetailAndTxns = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const [accData, txnData] = await Promise.all([
-        apiRequest(`/api/accounts/${id}`),
-        apiRequest(`/api/accounts/${id}/transactions`),
-      ]);
-      setAccount(accData.account);
-      setTransactions(txnData.transactions || []);
-    } catch (err) {
-      setError(err.message || 'Failed to load account details.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Load account details independently from transaction history to avoid stale-response races.
   useEffect(() => {
-    fetchDetailAndTxns();
+    let cancelled = false;
+    const loadAccount = async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const data = await apiRequest(`/api/accounts/${id}`);
+        if (!cancelled) setAccount(data.account);
+      } catch (err) {
+        if (!cancelled) setError(err.message || 'Failed to load account details.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    loadAccount();
+    return () => { cancelled = true; };
   }, [id]);
+
+  // Every filter/page change loads only the requested page; prior requests are ignored.
+  useEffect(() => {
+    let cancelled = false;
+    const loadHistory = async () => {
+      setHistoryLoading(true);
+      setHistoryError('');
+      try {
+        const data = await apiRequest(`/api/accounts/${id}/transactions?${transactionQuery}`);
+        if (!cancelled) {
+          setTransactions(data.transactions || []);
+          setPagination(data.pagination || {
+            page: 1, per_page: perPage, total: 0, total_pages: 0,
+            has_next: false, has_previous: false,
+          });
+        }
+      } catch (err) {
+        if (!cancelled) setHistoryError(err.message || 'Could not load transaction history.');
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    };
+    loadHistory();
+    return () => { cancelled = true; };
+  }, [id, transactionQuery, historyReloadKey]);
 
   const handleTransactionSubmit = async (e) => {
     e.preventDefault();
@@ -105,12 +152,10 @@ export const AccountDetailPage = () => {
       setTxDesc('');
 
       // Refresh account details and transaction history
-      const [accData, txnData] = await Promise.all([
-        apiRequest(`/api/accounts/${id}`),
-        apiRequest(`/api/accounts/${id}/transactions`),
-      ]);
+      const accData = await apiRequest(`/api/accounts/${id}`);
       setAccount(accData.account);
-      setTransactions(txnData.transactions || []);
+      // Refresh the active filtered/sorted page instead of overwriting it with unfiltered history.
+      setHistoryReloadKey((current) => current + 1);
     } catch (err) {
       const actionLabel =
         txType === 'deposit' ? 'Deposit' : txType === 'withdrawal' ? 'Withdrawal' : 'Transfer';
@@ -303,51 +348,204 @@ export const AccountDetailPage = () => {
         )}
       </div>
 
-      {/* Transaction Ledger Table (Issue #7, #8) */}
+      {/* Transaction History (Issues #13, #14 and #15) */}
       <div className="card transaction-ledger-card">
         <div className="card-header-simple">
-          <h3>Transaction History &amp; Ledger (Issue #7)</h3>
-          <span className="badge-count">{transactions.length} record(s)</span>
+          <div>
+            <h3>Transaction History</h3>
+            <p className="subtitle">Search, filter, sort, and export account transactions.</p>
+          </div>
+          <span className="badge-count">{pagination.total} record(s)</span>
         </div>
 
-        {transactions.length === 0 ? (
+        <div className="transaction-toolbar">
+          <div className="form-group">
+            <label htmlFor="txn-search">Search reference or description</label>
+            <input
+              id="txn-search"
+              className="input-control"
+              value={filters.search}
+              placeholder="Search transactions..."
+              onChange={(event) => {
+                setFilters({ ...filters, search: event.target.value });
+                setPage(1);
+              }}
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="txn-type">Transaction type</label>
+            <select
+              id="txn-type"
+              className="input-control"
+              value={filters.type}
+              onChange={(event) => {
+                setFilters({ ...filters, type: event.target.value });
+                setPage(1);
+              }}
+            >
+              <option value="">All transactions</option>
+              <option value="deposit">Deposit</option>
+              <option value="withdrawal">Withdrawal</option>
+              <option value="transfer_in">Transfer in</option>
+              <option value="transfer_out">Transfer out</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label htmlFor="txn-from">From date</label>
+            <input
+              id="txn-from"
+              type="date"
+              className="input-control"
+              value={filters.date_from}
+              onChange={(event) => {
+                setFilters({ ...filters, date_from: event.target.value });
+                setPage(1);
+              }}
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="txn-to">To date</label>
+            <input
+              id="txn-to"
+              type="date"
+              className="input-control"
+              value={filters.date_to}
+              onChange={(event) => {
+                setFilters({ ...filters, date_to: event.target.value });
+                setPage(1);
+              }}
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="txn-sort">Sort by</label>
+            <select
+              id="txn-sort"
+              className="input-control"
+              value={filters.sort_by}
+              onChange={(event) => {
+                setFilters({ ...filters, sort_by: event.target.value });
+                setPage(1);
+              }}
+            >
+              <option value="date">Date</option>
+              <option value="amount">Amount</option>
+              <option value="type">Type</option>
+              <option value="reference">Reference</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label htmlFor="txn-order">Order</label>
+            <select
+              id="txn-order"
+              className="input-control"
+              value={filters.sort_order}
+              onChange={(event) => {
+                setFilters({ ...filters, sort_order: event.target.value });
+                setPage(1);
+              }}
+            >
+              <option value="desc">Descending</option>
+              <option value="asc">Ascending</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="transaction-actions">
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={() => {
+              setFilters({
+                type: '',
+                search: '',
+                date_from: '',
+                date_to: '',
+                sort_by: 'date',
+                sort_order: 'desc',
+              });
+              setPage(1);
+            }}
+          >
+            Clear filters
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              const params = new URLSearchParams();
+              Object.entries(filters).forEach(([key, value]) => {
+                if (value) params.set(key, value);
+              });
+              window.location.href = `/api/accounts/${id}/transactions/export?${params.toString()}`;
+            }}
+          >
+            Export CSV statement
+          </button>
+          <label className="page-size-control">
+            Rows per page
+            <select
+              className="input-control"
+              value={perPage}
+              onChange={(event) => {
+                setPerPage(Number(event.target.value));
+                setPage(1);
+              }}
+            >
+              <option value={5}>5</option>
+              <option value={10}>10</option>
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+            </select>
+          </label>
+        </div>
+
+        {historyError && <div className="alert alert-danger">{historyError}</div>}
+        {historyLoading ? (
+          <p role="status">Loading transaction history...</p>
+        ) : transactions.length === 0 ? (
           <div className="empty-state small">
-            <p>No transactions recorded yet for this account.</p>
+            <p>No transactions match these filters.</p>
           </div>
         ) : (
           <div className="table-responsive">
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Ref ID</th>
-                  <th>Date &amp; Time</th>
+                  <th>Reference</th>
+                  <th>Date &amp; time</th>
                   <th>Type</th>
                   <th>Amount (₹)</th>
-                  <th>Balance After (₹)</th>
+                  <th>Balance after (₹)</th>
                   <th>Description</th>
                 </tr>
               </thead>
               <tbody>
-                {transactions.map((t) => {
-                  const isCredit = isCreditTransaction(t.transaction_type);
+                {transactions.map((transaction) => {
+                  const isCredit = isCreditTransaction(transaction.transaction_type);
                   return (
-                    <tr key={t.id}>
-                      <td><code>{t.reference_id}</code></td>
-                      <td><small>{t.created_at}</small></td>
+                    <tr key={transaction.id}>
+                      <td><code>{transaction.reference_id}</code></td>
+                      <td><small>{transaction.created_at}</small></td>
                       <td>
                         <span className={`status-badge ${isCredit ? 'badge-active' : 'badge-closed'}`}>
-                          {formatTransactionTypeLabel(t.transaction_type)}
+                          {formatTransactionTypeLabel(transaction.transaction_type)}
                         </span>
                       </td>
                       <td>
                         <strong className={isCredit ? 'text-success' : 'text-danger'}>
-                          {isCredit ? '+' : '-'}₹{parseFloat(t.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          {isCredit ? '+' : '-'}₹{Number(transaction.amount).toLocaleString('en-IN', {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
                         </strong>
                       </td>
                       <td>
-                        ₹{parseFloat(t.balance_after).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        ₹{Number(transaction.balance_after).toLocaleString('en-IN', {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}
                       </td>
-                      <td>{t.description || '—'}</td>
+                      <td>{transaction.description || '—'}</td>
                     </tr>
                   );
                 })}
@@ -355,6 +553,28 @@ export const AccountDetailPage = () => {
             </table>
           </div>
         )}
+
+        <div className="pagination-controls">
+          <button
+            type="button"
+            className="btn btn-outline"
+            disabled={!pagination.has_previous || historyLoading}
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            Previous
+          </button>
+          <span>
+            Page {pagination.page || page} of {Math.max(1, pagination.total_pages || 0)}
+          </span>
+          <button
+            type="button"
+            className="btn btn-outline"
+            disabled={!pagination.has_next || historyLoading}
+            onClick={() => setPage((current) => current + 1)}
+          >
+            Next
+          </button>
+        </div>
       </div>
     </div>
   );
