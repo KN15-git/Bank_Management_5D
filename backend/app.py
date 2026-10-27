@@ -14,6 +14,8 @@ Implements:
 - Issue #20: System Response Time
 - Issue #21: System Availability and Reliability
 """
+import csv
+import io
 import os
 import re
 import secrets
@@ -1116,52 +1118,157 @@ def execute_transfer(
     return transfer_payload, None, 201
 
 
-def get_account_transactions(user, account_id: int):
-    """
-    Issue #7: Retrieve transaction history for an account.
-    Ownership enforced: Customer can only view own transactions; Employee/Admin can view all.
-    """
+ALLOWED_TRANSACTION_SORTS = {
+    "date": "t.created_at",
+    "amount": "t.amount",
+    "type": "t.transaction_type",
+    "reference": "t.reference_id",
+}
+
+
+def get_account_transactions(
+    user,
+    account_id: int,
+    transaction_type: str = None,
+    search: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    sort_by: str = "date",
+    sort_order: str = "desc",
+    page: int = 1,
+    per_page: int = 10,
+):
+    """Return an account owner's transaction history with filters and pagination."""
+    from datetime import date, timedelta
+
     db = get_db()
     cursor = db.cursor()
     cursor.execute(
         "SELECT id, account_number, user_id FROM accounts WHERE id = ?",
         (account_id,),
     )
-    acc = cursor.fetchone()
-    if not acc:
+    account = cursor.fetchone()
+    if not account:
         return None, "Account not found", 404
 
-    can_access, err_code, err_msg = assert_can_access_account(user, acc)
+    can_access, error_code, error_message = assert_can_access_account(user, account)
     if not can_access:
-        return None, err_msg, err_code
+        return None, error_message, error_code
 
+    transaction_type = str(transaction_type).strip().lower() if transaction_type else None
+    search = str(search).strip() if search else None
+    sort_by = str(sort_by).strip().lower()
+    sort_order = str(sort_order).strip().lower()
+
+    valid_types = {"deposit", "withdrawal", "transfer_in", "transfer_out"}
+    if transaction_type and transaction_type not in valid_types:
+        return None, "Invalid transaction type filter", 400
+    if sort_by not in ALLOWED_TRANSACTION_SORTS:
+        return None, "Invalid sort_by. Allowed: date, amount, type, reference", 400
+    if sort_order not in {"asc", "desc"}:
+        return None, "Invalid sort_order. Allowed: asc, desc", 400
+
+    try:
+        page = int(page)
+        per_page = int(per_page)
+    except (TypeError, ValueError):
+        return None, "page and per_page must be integers", 400
+    if page < 1:
+        return None, "page must be at least 1", 400
+    if per_page < 1:
+        return None, "per_page must be at least 1", 400
+    per_page = min(per_page, 100)
+
+    date_to_exclusive = None
+    try:
+        for label, value in (("date_from", date_from), ("date_to", date_to)):
+            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value)):
+                return None, f"{label} must use YYYY-MM-DD format", 400
+        if date_from:
+            date.fromisoformat(date_from)
+        if date_to:
+            end_date = date.fromisoformat(date_to)
+            date_to_exclusive = (end_date + timedelta(days=1)).isoformat()
+        if date_from and date_to and date.fromisoformat(date_from) > date.fromisoformat(date_to):
+            return None, "date_from cannot be after date_to", 400
+    except ValueError:
+        return None, "Dates must use YYYY-MM-DD format", 400
+
+    conditions = ["t.account_id = ?"]
+    parameters = [account_id]
+    if transaction_type:
+        conditions.append("t.transaction_type = ?")
+        parameters.append(transaction_type)
+    if search:
+        conditions.append(
+            "(LOWER(t.reference_id) LIKE ? OR LOWER(COALESCE(t.description, '')) LIKE ?)"
+        )
+        term = f"%{search.lower()}%"
+        parameters.extend([term, term])
+    if date_from:
+        conditions.append("date(t.created_at) >= date(?)")
+        parameters.append(date_from)
+    if date_to_exclusive:
+        conditions.append("datetime(t.created_at) < datetime(?)")
+        parameters.append(date_to_exclusive)
+
+    where_sql = " AND ".join(conditions)
     cursor.execute(
-        """
-        SELECT id, reference_id, account_id, transaction_type, amount, balance_after, description, created_at
-        FROM transactions
-        WHERE account_id = ?
-        ORDER BY id DESC
+        f"SELECT COUNT(*) AS total FROM transactions t WHERE {where_sql}",
+        parameters,
+    )
+    total = cursor.fetchone()["total"]
+
+    order_column = ALLOWED_TRANSACTION_SORTS[sort_by]
+    order_direction = sort_order.upper()
+    offset = (page - 1) * per_page
+    cursor.execute(
+        f"""
+        SELECT t.id, t.reference_id, t.account_id, t.transaction_type,
+               t.amount, t.balance_after, t.description, t.created_at
+        FROM transactions t
+        WHERE {where_sql}
+        ORDER BY {order_column} {order_direction}, t.id {order_direction}
+        LIMIT ? OFFSET ?
         """,
-        (account_id,),
+        [*parameters, per_page, offset],
     )
     rows = cursor.fetchall()
-    txns = [
+    transactions = [
         {
-            "id": r["id"],
-            "reference_id": r["reference_id"],
-            "account_id": r["account_id"],
-            "transaction_type": r["transaction_type"],
-            "amount_paise": r["amount"],
-            "amount": paise_to_rupees_str(r["amount"]),
-            "balance_after_paise": r["balance_after"],
-            "balance_after": paise_to_rupees_str(r["balance_after"]),
-            "description": r["description"],
-            "created_at": str(r["created_at"]),
+            "id": row["id"],
+            "reference_id": row["reference_id"],
+            "account_id": row["account_id"],
+            "transaction_type": row["transaction_type"],
+            "amount_paise": row["amount"],
+            "amount": paise_to_rupees_str(row["amount"]),
+            "balance_after_paise": row["balance_after"],
+            "balance_after": paise_to_rupees_str(row["balance_after"]),
+            "description": row["description"],
+            "created_at": str(row["created_at"]),
         }
-        for r in rows
+        for row in rows
     ]
-    return txns, None, 200
-
+    offset_end = offset + len(transactions)
+    return {
+        "transactions": transactions,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": (total + per_page - 1) // per_page,
+            "has_next": offset_end < total,
+            "has_previous": page > 1 and offset < total,
+        },
+        "filters": {
+            "type": transaction_type,
+            "search": search,
+            "date_from": date_from,
+            "date_to": date_to,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        },
+    }, None, 200
 
 def get_account_transfers(user, account_id: int):
     """
@@ -1529,12 +1636,82 @@ def list_account_transfers(account_id):
 @account_bp.route("/<int:account_id>/transactions", methods=["GET"])
 @login_required
 def list_account_txns(account_id):
-    """Issue #7: Get transaction history for an account."""
-    txns, err, code = get_account_transactions(current_user, account_id)
-    if err:
-        return jsonify({"error": err}), code
-    return jsonify({"transactions": txns}), 200
+    """Issue #13/#14: List transaction history with filter, sort, and paging."""
+    result, error, code = get_account_transactions(
+        current_user,
+        account_id,
+        transaction_type=request.args.get("type") or None,
+        search=request.args.get("search") or None,
+        date_from=request.args.get("date_from") or None,
+        date_to=request.args.get("date_to") or None,
+        sort_by=request.args.get("sort_by", "date"),
+        sort_order=request.args.get("sort_order", "desc"),
+        page=request.args.get("page", 1),
+        per_page=request.args.get("per_page", 10),
+    )
+    if error:
+        return jsonify({"error": error}), code
+    return jsonify(result), 200
 
+
+@account_bp.route("/<int:account_id>/transactions/export", methods=["GET"])
+@login_required
+def export_account_txns(account_id):
+    """Issue #15: Export all transactions matching the selected filters as CSV."""
+    common_filters = {
+        "transaction_type": request.args.get("type") or None,
+        "search": request.args.get("search") or None,
+        "date_from": request.args.get("date_from") or None,
+        "date_to": request.args.get("date_to") or None,
+        "sort_by": request.args.get("sort_by", "date"),
+        "sort_order": request.args.get("sort_order", "desc"),
+    }
+    first_page, error, code = get_account_transactions(
+        current_user, account_id, page=1, per_page=100, **common_filters
+    )
+    if error:
+        return jsonify({"error": error}), code
+
+    transactions = list(first_page["transactions"])
+    for page_number in range(2, first_page["pagination"]["total_pages"] + 1):
+        next_page, error, code = get_account_transactions(
+            current_user,
+            account_id,
+            page=page_number,
+            per_page=100,
+            **common_filters,
+        )
+        if error:
+            return jsonify({"error": error}), code
+        transactions.extend(next_page["transactions"])
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Transaction Reference", "Date & Time", "Type", "Amount (INR)",
+        "Balance After (INR)", "Description", "Account ID",
+    ])
+    for transaction in transactions:
+        description = transaction["description"] or ""
+        if description.startswith(("=", "+", "-", "@", "\t", "\r")):
+            description = "'" + description
+        writer.writerow([
+            transaction["reference_id"],
+            transaction["created_at"],
+            transaction["transaction_type"],
+            transaction["amount"],
+            transaction["balance_after"],
+            description,
+            transaction["account_id"],
+        ])
+
+    from flask import Response
+    response = Response("\ufeff" + output.getvalue(), mimetype="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="account_{account_id}_statement.csv"'
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response, 200
 
 # ==============================================================================
 # 7. APP FACTORY

@@ -407,3 +407,42 @@ body {
   margin-bottom: 16px;
   min-width: 160px;
 }
+
+
+/* Transaction history filters, export and pagination (Issues #13-#15) */
+.transaction-toolbar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.transaction-toolbar .form-group { margin-bottom: 0; }
+.transaction-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+  margin: 10px 0 16px;
+}
+.page-size-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: .85rem;
+}
+.page-size-control .input-control { width: auto; min-width: 76px; }
+.pagination-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 16px;
+  padding-top: 16px;
+}
+.pagination-controls button:disabled { opacity: .45; cursor: not-allowed; }
+.transaction-ledger-card .subtitle { margin: 4px 0 0; }
+@media (max-width: 600px) {
+  .transaction-actions { align-items: stretch; }
+  .transaction-actions > button { width: 100%; }
+  .pagination-controls { gap: 8px; font-size: .85rem; }
+}
