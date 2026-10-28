@@ -879,3 +879,219 @@ def test_issue_21_sustained_load_availability_and_consistency(client):
     # After 10 cycles of (+100.00 - 40.00): Acc 1 = ₹2100.00, Acc 2 = ₹400.00
     assert client.get("/api/accounts/1/balance").get_json()["balance"] == "2100.00"
     assert client.get("/api/accounts/2/balance").get_json()["balance"] == "400.00"
+
+
+# ==============================================================================
+# ISSUE #10, #11, #12: LOAN APPLICATION, REVIEW & APPROVAL/REJECTION TESTS
+# ==============================================================================
+def test_issue_10_customer_submit_loan_application_success(client):
+    """Issue #10: Authenticated customer submits a valid loan application and receives a reference ID and pending status."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    res = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "loan_type": "home",
+            "amount": "250000.00",
+            "term_months": 60,
+            "account_id": 1,
+            "purpose": "Purchase of residential apartment",
+        },
+    )
+    assert res.status_code == 201
+    data = res.get_json()
+    assert data["message"] == "Loan application submitted successfully"
+    loan = data["loan"]
+    assert loan["reference_id"].startswith("LN")
+    assert loan["loan_type"] == "home"
+    assert loan["amount"] == "250000.00"
+    assert loan["amount_paise"] == 25000000
+    assert loan["term_months"] == 60
+    assert loan["account_id"] == 1
+    assert loan["purpose"] == "Purchase of residential apartment"
+    assert loan["status"] == "pending"
+    assert loan["reviewed_by"] is None
+
+
+def test_issue_10_loan_application_validation_errors(client):
+    """Issue #10: Missing or invalid loan fields (amount, type, term, purpose, unowned account) are rejected with 400/403."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # Missing amount
+    res_no_amt = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={"loan_type": "personal", "term_months": 12, "purpose": "Medical expenses"},
+    )
+    assert res_no_amt.status_code == 400
+
+    # Zero or negative amount
+    res_bad_amt = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={"loan_type": "personal", "amount": "-500.00", "term_months": 12, "purpose": "Medical"},
+    )
+    assert res_bad_amt.status_code == 400
+
+    # Invalid loan type
+    res_bad_type = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={"loan_type": "crypto", "amount": "5000.00", "term_months": 12, "purpose": "Speculation"},
+    )
+    assert res_bad_type.status_code == 400
+
+    # Invalid term_months
+    res_bad_term = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={"loan_type": "personal", "amount": "5000.00", "term_months": 0, "purpose": "Travel"},
+    )
+    assert res_bad_term.status_code == 400
+
+    # Blank purpose
+    res_no_purpose = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={"loan_type": "personal", "amount": "5000.00", "term_months": 12, "purpose": "   "},
+    )
+    assert res_no_purpose.status_code == 400
+
+    # Account owned by another customer (cust2 owns account 3)
+    res_other_acc = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "loan_type": "personal",
+            "amount": "5000.00",
+            "term_months": 12,
+            "account_id": 3,
+            "purpose": "Personal use",
+        },
+    )
+    assert res_other_acc.status_code == 403
+
+
+def test_issue_11_loan_review_queue_and_ownership_isolation(client):
+    """
+    Issue #11: Customers only see their own loans; Employees and Admins see all loans in the review queue
+    and can filter by status.
+    """
+    # cust1 submits a loan
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf1 = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    r1 = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf1},
+        json={"loan_type": "education", "amount": "80000.00", "term_months": 36, "purpose": "University tuition"},
+    )
+    assert r1.status_code == 201
+    loan1_id = r1.get_json()["loan"]["id"]
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf1})
+
+    # cust2 submits a loan
+    client.post("/api/auth/login", json={"username": "cust2", "password": "CustPass2"})
+    csrf2 = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    r2 = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf2},
+        json={"loan_type": "vehicle", "amount": "120000.00", "term_months": 48, "purpose": "Two-wheeler purchase"},
+    )
+    assert r2.status_code == 201
+    loan2_id = r2.get_json()["loan"]["id"]
+
+    # cust2 can only see own loan in list and is forbidden (403) from viewing cust1's loan
+    cust2_loans = client.get("/api/loans").get_json()["loans"]
+    assert len(cust2_loans) == 1
+    assert cust2_loans[0]["id"] == loan2_id
+    assert client.get(f"/api/loans/{loan1_id}").status_code == 403
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf2})
+
+    # Employee (loan officer) sees all loans in the review queue and can inspect any loan
+    client.post("/api/auth/login", json={"username": "emp1", "password": "EmpPass1"})
+    emp_loans = client.get("/api/loans?status=pending").get_json()["loans"]
+    assert len(emp_loans) == 2
+    assert client.get(f"/api/loans/{loan1_id}").status_code == 200
+    assert client.get(f"/api/loans/{loan2_id}").status_code == 200
+
+
+def test_issue_12_loan_approval_and_rejection_workflow(client):
+    """
+    Issue #12: Loan officer (Employee/Admin) approves or rejects pending loans;
+    customers are forbidden from making loan decisions; rejecting requires a non-blank reason;
+    already decided loans cannot be re-decided.
+    """
+    # cust1 submits two loan applications
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf_cust = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    loan_a = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf_cust},
+        json={"loan_type": "personal", "amount": "30000.00", "term_months": 12, "purpose": "Home renovation"},
+    ).get_json()["loan"]
+
+    loan_b = client.post(
+        "/api/loans",
+        headers={"X-CSRF-Token": csrf_cust},
+        json={"loan_type": "business", "amount": "500000.00", "term_months": 60, "purpose": "Working capital"},
+    ).get_json()["loan"]
+
+    # Customer cannot approve their own loan (403 Forbidden)
+    cust_decide = client.patch(
+        f"/api/loans/{loan_a['id']}/decision",
+        headers={"X-CSRF-Token": csrf_cust},
+        json={"decision": "approved"},
+    )
+    assert cust_decide.status_code == 403
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf_cust})
+
+    # Login as Employee (Loan Officer)
+    client.post("/api/auth/login", json={"username": "emp1", "password": "EmpPass1"})
+    csrf_emp = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # 1. Approve loan_a
+    approve_res = client.patch(
+        f"/api/loans/{loan_a['id']}/decision",
+        headers={"X-CSRF-Token": csrf_emp},
+        json={"decision": "approved", "decision_notes": "Income and credit verified"},
+    )
+    assert approve_res.status_code == 200
+    approved_loan = approve_res.get_json()["loan"]
+    assert approved_loan["status"] == "approved"
+    assert approved_loan["reviewer_username"] == "emp1"
+    assert approved_loan["decision_notes"] == "Income and credit verified"
+    assert approved_loan["reviewed_at"] is not None
+
+    # 2. Rejecting loan_b without a rejection reason must fail with 400 (prevents Defect IT_09)
+    reject_blank = client.patch(
+        f"/api/loans/{loan_b['id']}/decision",
+        headers={"X-CSRF-Token": csrf_emp},
+        json={"decision": "rejected", "rejection_reason": "   "},
+    )
+    assert reject_blank.status_code == 400
+    assert "Rejection reason is required" in reject_blank.get_json()["error"]
+
+    # 3. Reject loan_b with a valid rejection reason
+    reject_res = client.patch(
+        f"/api/loans/{loan_b['id']}/decision",
+        headers={"X-CSRF-Token": csrf_emp},
+        json={"decision": "rejected", "rejection_reason": "Debt-to-income ratio exceeds policy limit"},
+    )
+    assert reject_res.status_code == 200
+    rejected_loan = reject_res.get_json()["loan"]
+    assert rejected_loan["status"] == "rejected"
+    assert rejected_loan["rejection_reason"] == "Debt-to-income ratio exceeds policy limit"
+    assert rejected_loan["reviewer_username"] == "emp1"
+
+    # 4. Attempting to re-decide an already processed loan returns 400
+    re_decide = client.patch(
+        f"/api/loans/{loan_a['id']}/decision",
+        headers={"X-CSRF-Token": csrf_emp},
+        json={"decision": "rejected", "rejection_reason": "Changed mind"},
+    )
+    assert re_decide.status_code == 400
+    assert "already been processed" in re_decide.get_json()["error"]

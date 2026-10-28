@@ -72,6 +72,29 @@ class TransactionType(str, Enum):
     TRANSFER_IN = "transfer_in"
 
 
+class LoanType(str, Enum):
+    PERSONAL = "personal"
+    HOME = "home"
+    EDUCATION = "education"
+    VEHICLE = "vehicle"
+    BUSINESS = "business"
+
+
+class LoanStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+DEFAULT_LOAN_RATES = {
+    LoanType.PERSONAL.value: 11.5,
+    LoanType.HOME.value: 8.5,
+    LoanType.EDUCATION.value: 9.0,
+    LoanType.VEHICLE.value: 9.5,
+    LoanType.BUSINESS.value: 12.0,
+}
+
+
 # ==============================================================================
 # 2. USER MODEL & DATABASE HELPERS
 # ==============================================================================
@@ -1327,12 +1350,329 @@ def get_account_transfers(user, account_id: int):
 
 
 # ==============================================================================
+# 5C. LOAN MANAGEMENT SERVICES (#10, #11, #12)
+# ==============================================================================
+def generate_loan_reference() -> str:
+    """Generate unique alphanumeric loan reference ID (e.g. LN9876543210AB)."""
+    db = get_db()
+    cursor = db.cursor()
+    while True:
+        ref = f"LN{secrets.token_hex(6).upper()}"
+        cursor.execute("SELECT id FROM loans WHERE reference_id = ?", (ref,))
+        if not cursor.fetchone():
+            return ref
+
+
+def _format_loan_row(row) -> dict:
+    return {
+        "id": row["id"],
+        "reference_id": row["reference_id"],
+        "user_id": row["user_id"],
+        "applicant_username": row["applicant_username"],
+        "applicant_name": row["applicant_name"],
+        "applicant_email": row["applicant_email"],
+        "account_id": row["account_id"],
+        "account_number": row["account_number"],
+        "loan_type": row["loan_type"],
+        "amount_paise": row["amount"],
+        "amount": paise_to_rupees_str(row["amount"]),
+        "term_months": row["term_months"],
+        "interest_rate": row["interest_rate"],
+        "purpose": row["purpose"],
+        "status": row["status"],
+        "reviewed_by": row["reviewed_by"],
+        "reviewer_username": row["reviewer_username"],
+        "rejection_reason": row["rejection_reason"],
+        "decision_notes": row["decision_notes"],
+        "reviewed_at": str(row["reviewed_at"]) if row["reviewed_at"] else None,
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def submit_loan_application(
+    user,
+    amount_rupees,
+    loan_type: str = "personal",
+    term_months=12,
+    purpose: str = None,
+    account_id=None,
+):
+    """
+    Issue #10: Submit an online loan application with validation and reference ID generation.
+    Application enters the loan officer review queue with 'pending' status.
+    """
+    if amount_rupees is None or str(amount_rupees).strip() == "":
+        return None, "Loan amount is required", 400
+
+    try:
+        amount_paise = rupees_to_paise(amount_rupees)
+    except ValueError:
+        return None, "Invalid loan amount format", 400
+
+    if amount_paise <= 0:
+        return None, "Enter a valid amount. Loan amount must be greater than zero.", 400
+
+    clean_type = str(loan_type).strip().lower() if loan_type else ""
+    valid_loan_types = [t.value for t in LoanType]
+    if clean_type not in valid_loan_types:
+        return None, f"Invalid loan_type. Allowed: {', '.join(valid_loan_types)}", 400
+
+    if term_months is None or str(term_months).strip() == "":
+        return None, "Loan term_months is required", 400
+    try:
+        term_months_int = int(term_months)
+    except (ValueError, TypeError):
+        return None, "term_months must be a valid integer", 400
+    if term_months_int < 1 or term_months_int > 360:
+        return None, "term_months must be between 1 and 360 months", 400
+
+    clean_purpose = (purpose or "").strip()
+    if not clean_purpose:
+        return None, "Loan purpose is required", 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    resolved_account_id = None
+    if account_id is not None and str(account_id).strip() != "":
+        try:
+            resolved_account_id = int(account_id)
+        except (ValueError, TypeError):
+            return None, "Invalid account_id", 400
+
+        cursor.execute(
+            "SELECT id, account_number, user_id, status FROM accounts WHERE id = ?",
+            (resolved_account_id,),
+        )
+        acc = cursor.fetchone()
+        if not acc:
+            return None, "Linked account not found", 404
+        if acc["user_id"] != user.id and user.role == Role.CUSTOMER.value:
+            return None, "Access forbidden: you do not own this account", 403
+        if acc["status"] != AccountStatus.ACTIVE.value:
+            return None, f"Linked account must be active (current status: {acc['status']})", 400
+
+    ref_id = generate_loan_reference()
+    interest_rate = DEFAULT_LOAN_RATES.get(clean_type, 10.5)
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO loans (
+                reference_id, user_id, account_id, loan_type, amount,
+                term_months, interest_rate, purpose, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ref_id,
+                user.id,
+                resolved_account_id,
+                clean_type,
+                amount_paise,
+                term_months_int,
+                interest_rate,
+                clean_purpose,
+                LoanStatus.PENDING.value,
+            ),
+        )
+        loan_id = cursor.lastrowid
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return None, f"Failed to submit loan application: {str(e)}", 500
+
+    log_event(
+        "LOAN_APPLIED",
+        user_id=user.id,
+        details=f"Submitted {clean_type} loan application {ref_id} for ₹{paise_to_rupees_str(amount_paise)} ({term_months_int} months)",
+    )
+    loan_dict, _, _ = get_loan_by_id(user, loan_id)
+    return loan_dict, None, 201
+
+
+def get_loan_applications(user, status_filter: str = None):
+    """
+    Issue #11: List loan applications.
+    Customers see their own applications; Employees and Admins see the full review queue.
+    """
+    clean_status = str(status_filter).strip().lower() if status_filter else None
+    valid_statuses = [s.value for s in LoanStatus]
+    if clean_status and clean_status not in valid_statuses:
+        return None, f"Invalid status filter. Allowed: {', '.join(valid_statuses)}", 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    base_query = """
+        SELECT l.id, l.reference_id, l.user_id, l.account_id, l.loan_type, l.amount,
+               l.term_months, l.interest_rate, l.purpose, l.status, l.reviewed_by,
+               l.rejection_reason, l.decision_notes, l.reviewed_at, l.created_at, l.updated_at,
+               u.username AS applicant_username, u.full_name AS applicant_name, u.email AS applicant_email,
+               a.account_number AS account_number,
+               r.username AS reviewer_username
+        FROM loans l
+        JOIN users u ON l.user_id = u.id
+        LEFT JOIN accounts a ON l.account_id = a.id
+        LEFT JOIN users r ON l.reviewed_by = r.id
+    """
+    conditions = []
+    params = []
+
+    if user.role == Role.CUSTOMER.value:
+        conditions.append("l.user_id = ?")
+        params.append(user.id)
+
+    if clean_status:
+        conditions.append("l.status = ?")
+        params.append(clean_status)
+
+    if conditions:
+        base_query += " WHERE " + " AND ".join(conditions)
+
+    base_query += " ORDER BY l.id DESC"
+    cursor.execute(base_query, params)
+    rows = cursor.fetchall()
+    return [_format_loan_row(r) for r in rows], None, 200
+
+
+def get_loan_by_id(user, loan_id: int):
+    """
+    Issue #11: Retrieve single loan application details for review or customer status check.
+    """
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        """
+        SELECT l.id, l.reference_id, l.user_id, l.account_id, l.loan_type, l.amount,
+               l.term_months, l.interest_rate, l.purpose, l.status, l.reviewed_by,
+               l.rejection_reason, l.decision_notes, l.reviewed_at, l.created_at, l.updated_at,
+               u.username AS applicant_username, u.full_name AS applicant_name, u.email AS applicant_email,
+               a.account_number AS account_number,
+               r.username AS reviewer_username
+        FROM loans l
+        JOIN users u ON l.user_id = u.id
+        LEFT JOIN accounts a ON l.account_id = a.id
+        LEFT JOIN users r ON l.reviewed_by = r.id
+        WHERE l.id = ?
+        """,
+        (loan_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, "Loan application not found", 404
+
+    if user.role == Role.CUSTOMER.value and row["user_id"] != user.id:
+        log_event(
+            "UNAUTHORIZED_LOAN_ACCESS",
+            user_id=user.id,
+            details=f"Customer {user.username} attempted to access loan id {loan_id} owned by user_id {row['user_id']}",
+        )
+        return None, "Access forbidden: you do not own this loan application", 403
+
+    return _format_loan_row(row), None, 200
+
+
+def review_loan_application(
+    reviewer_user,
+    loan_id: int,
+    decision: str,
+    rejection_reason: str = None,
+    decision_notes: str = None,
+):
+    """
+    Issue #11 & #12: Loan officer (Employee/Admin) reviews and approves or rejects a pending loan application.
+    Enforces non-blank rejection_reason when rejecting a loan (prevents Defect IT_09).
+    """
+    if reviewer_user.role not in [Role.EMPLOYEE.value, Role.ADMIN.value]:
+        return None, "Access forbidden: only loan officers (employees/administrators) can review loans", 403
+
+    raw_decision = str(decision).strip().lower() if decision else ""
+    decision_map = {
+        "approve": LoanStatus.APPROVED.value,
+        "approved": LoanStatus.APPROVED.value,
+        "reject": LoanStatus.REJECTED.value,
+        "rejected": LoanStatus.REJECTED.value,
+    }
+    if raw_decision not in decision_map:
+        return None, "Invalid decision. Allowed: approved, rejected", 400
+
+    target_status = decision_map[raw_decision]
+    clean_reason = (rejection_reason or "").strip()
+    clean_notes = (decision_notes or "").strip()
+
+    if target_status == LoanStatus.REJECTED.value:
+        if not clean_reason:
+            clean_reason = clean_notes
+        if not clean_reason:
+            return None, "Rejection reason is required when rejecting a loan application", 400
+        if not clean_notes:
+            clean_notes = clean_reason
+    else:
+        clean_reason = None
+        if not clean_notes:
+            clean_notes = "Approved after officer review"
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT id, reference_id, user_id, amount, status FROM loans WHERE id = ?",
+        (loan_id,),
+    )
+    loan_row = cursor.fetchone()
+    if not loan_row:
+        return None, "Loan application not found", 404
+
+    if loan_row["status"] != LoanStatus.PENDING.value:
+        return (
+            None,
+            f"Loan application has already been processed (current status: {loan_row['status']})",
+            400,
+        )
+
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+        cursor.execute(
+            """
+            UPDATE loans
+            SET status = ?,
+                reviewed_by = ?,
+                rejection_reason = ?,
+                decision_notes = ?,
+                reviewed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+            """,
+            (target_status, reviewer_user.id, clean_reason, clean_notes, loan_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Loan application status could not be updated")
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return None, f"Failed to process loan decision: {str(e)}", 500
+
+    event_action = "LOAN_APPROVED" if target_status == LoanStatus.APPROVED.value else "LOAN_REJECTED"
+    log_event(
+        event_action,
+        user_id=reviewer_user.id,
+        details=f"Loan {loan_row['reference_id']} {target_status} by {reviewer_user.username}"
+        + (f" (Reason: {clean_reason})" if clean_reason else ""),
+    )
+
+    updated_loan, _, _ = get_loan_by_id(reviewer_user, loan_id)
+    return updated_loan, None, 200
+
+
+# ==============================================================================
 # 6. BLUEPRINT ROUTES
 # ==============================================================================
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 user_bp = Blueprint("users", __name__, url_prefix="/api/users")
 account_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfer_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
+loan_bp = Blueprint("loans", __name__, url_prefix="/api/loans")
 
 
 # --- Auth Endpoints (#2) ---
@@ -1713,6 +2053,69 @@ def export_account_txns(account_id):
     response.headers["Cache-Control"] = "no-store"
     return response, 200
 
+# --- Loan Application, Review & Approval/Rejection Endpoints (#10, #11, #12) ---
+@loan_bp.route("", methods=["POST"])
+@login_required
+def apply_for_loan():
+    """Issue #10: Submit a new loan application."""
+    data = request.get_json(silent=True) or {}
+    loan, err, code = submit_loan_application(
+        user=current_user,
+        amount_rupees=data.get("amount"),
+        loan_type=data.get("loan_type", "personal"),
+        term_months=data.get("term_months", 12),
+        purpose=data.get("purpose"),
+        account_id=data.get("account_id"),
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Loan application submitted successfully", "loan": loan}), 201
+
+
+@loan_bp.route("", methods=["GET"])
+@login_required
+def list_loans():
+    """Issue #11: List loan applications (own for customer; review queue for employee/admin)."""
+    status_filter = request.args.get("status") or None
+    loans, err, code = get_loan_applications(current_user, status_filter=status_filter)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"loans": loans}), 200
+
+
+@loan_bp.route("/<int:loan_id>", methods=["GET"])
+@login_required
+def get_loan_detail(loan_id):
+    """Issue #11: View single loan application details and status."""
+    loan, err, code = get_loan_by_id(current_user, loan_id)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"loan": loan}), 200
+
+
+@loan_bp.route("/<int:loan_id>/decision", methods=["PATCH", "POST"])
+@loan_bp.route("/<int:loan_id>/status", methods=["PATCH"])
+@loan_bp.route("/<int:loan_id>/review", methods=["POST", "PATCH"])
+@role_required(Role.EMPLOYEE.value, Role.ADMIN.value)
+def decide_loan(loan_id):
+    """Issue #11 & #12: Approve or reject a pending loan application."""
+    data = request.get_json(silent=True) or {}
+    decision = data.get("decision") or data.get("status") or data.get("action")
+    rejection_reason = data.get("rejection_reason") or data.get("reason")
+    decision_notes = data.get("decision_notes") or data.get("notes")
+
+    loan, err, code = review_loan_application(
+        reviewer_user=current_user,
+        loan_id=loan_id,
+        decision=decision,
+        rejection_reason=rejection_reason,
+        decision_notes=decision_notes,
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": f"Loan application {loan['status']} successfully", "loan": loan}), 200
+
+
 # ==============================================================================
 # 7. APP FACTORY
 # ==============================================================================
@@ -1785,6 +2188,7 @@ def create_app(custom_config=None):
     app.register_blueprint(user_bp)
     app.register_blueprint(account_bp)
     app.register_blueprint(transfer_bp)
+    app.register_blueprint(loan_bp)
 
     @app.errorhandler(sqlite3.Error)
     def err_database(e):
@@ -1832,3 +2236,10 @@ def create_app(custom_config=None):
         return jsonify({"error": "Internal server error"}), 500
 
     return app
+
+
+
+if __name__ == "__main__":
+    app = create_app()
+    init_db(app)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

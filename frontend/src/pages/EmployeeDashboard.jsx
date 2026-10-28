@@ -6,8 +6,11 @@ import { useAuth } from '../context/AuthContext';
 export const EmployeeDashboard = () => {
   const { user } = useAuth();
   const [accounts, setAccounts] = useState([]);
+  const [loans, setLoans] = useState([]);
+  const [loanStatusFilter, setLoanStatusFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
   const [search, setSearch] = useState('');
 
   // Account creation form modal state
@@ -16,6 +19,11 @@ export const EmployeeDashboard = () => {
   const [accType, setAccType] = useState('savings');
   const [initialDeposit, setInitialDeposit] = useState('0.00');
   const [actionLoading, setActionLoading] = useState(false);
+
+  // Loan rejection modal state (Issues #11 & #12)
+  const [rejectingLoan, setRejectingLoan] = useState(null);
+  const [rejectionReason, setRejectionReason] = useState('');
+  const [loanActionLoading, setLoanActionLoading] = useState(false);
 
   const fetchAccounts = async (query = '') => {
     setLoading(true);
@@ -31,8 +39,21 @@ export const EmployeeDashboard = () => {
     }
   };
 
+  const fetchLoans = async (statusFilter = loanStatusFilter) => {
+    try {
+      const url = statusFilter
+        ? `/api/loans?status=${encodeURIComponent(statusFilter)}`
+        : '/api/loans';
+      const data = await apiRequest(url);
+      setLoans(data.loans || []);
+    } catch (err) {
+      setError(err.message || 'Failed to fetch loan applications.');
+    }
+  };
+
   useEffect(() => {
     fetchAccounts();
+    fetchLoans('');
   }, []);
 
   const handleSearch = (e) => {
@@ -84,12 +105,67 @@ export const EmployeeDashboard = () => {
     }
   };
 
+  const handleApproveLoan = async (loan) => {
+    setError('');
+    setSuccessMsg('');
+    setLoanActionLoading(true);
+    try {
+      const res = await apiRequest(`/api/loans/${loan.id}/decision`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          decision: 'approved',
+          decision_notes: 'Approved after officer verification',
+        }),
+      });
+      setSuccessMsg(`Loan ${res.loan.reference_id} approved successfully.`);
+      await fetchLoans(loanStatusFilter);
+    } catch (err) {
+      setError(err.message || 'Failed to approve loan.');
+    } finally {
+      setLoanActionLoading(false);
+    }
+  };
+
+  const handleRejectLoanSubmit = async (e) => {
+    e.preventDefault();
+    if (!rejectingLoan) return;
+    if (!rejectionReason.trim()) {
+      setError('A rejection reason is required when rejecting a loan application.');
+      return;
+    }
+    setError('');
+    setSuccessMsg('');
+    setLoanActionLoading(true);
+    try {
+      const res = await apiRequest(`/api/loans/${rejectingLoan.id}/decision`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          decision: 'rejected',
+          rejection_reason: rejectionReason.trim(),
+        }),
+      });
+      setSuccessMsg(`Loan ${res.loan.reference_id} rejected.`);
+      setRejectingLoan(null);
+      setRejectionReason('');
+      await fetchLoans(loanStatusFilter);
+    } catch (err) {
+      setError(err.message || 'Failed to reject loan.');
+    } finally {
+      setLoanActionLoading(false);
+    }
+  };
+
+  const handleLoanFilterChange = (newStatus) => {
+    setLoanStatusFilter(newStatus);
+    fetchLoans(newStatus);
+  };
+
   return (
     <div className="dashboard-layout">
       <header className="page-header">
         <div>
           <h1>Employee &amp; Management Portal</h1>
-          <p className="subtitle">Account and Balance Administration &bull; Role: {user?.role.toUpperCase()}</p>
+          <p className="subtitle">Account, Balance &amp; Loan Administration &bull; Role: {user?.role.toUpperCase()}</p>
         </div>
         <button className="btn btn-primary" onClick={() => setShowCreateModal(true)}>
           + Create Customer Account
@@ -97,6 +173,7 @@ export const EmployeeDashboard = () => {
       </header>
 
       {error && <div className="alert alert-danger">{error}</div>}
+      {successMsg && <div className="alert alert-success">{successMsg}</div>}
 
       <div className="search-bar-container">
         <form onSubmit={handleSearch} className="search-form">
@@ -196,6 +273,113 @@ export const EmployeeDashboard = () => {
         </div>
       )}
 
+      {/* Loan Applications Review Queue Section (Issues #11 & #12) */}
+      <section style={{ marginTop: '2.5rem' }}>
+        <div className="page-header" style={{ marginBottom: '1rem' }}>
+          <div>
+            <h2>Loan Applications Review Queue</h2>
+            <p className="subtitle">Review customer loan applications and process approvals or rejections</p>
+          </div>
+          <div className="action-buttons">
+            <select
+              className="input-control"
+              style={{ width: 'auto', minWidth: '160px' }}
+              value={loanStatusFilter}
+              onChange={(e) => handleLoanFilterChange(e.target.value)}
+            >
+              <option value="">All Statuses</option>
+              <option value="pending">Pending Review</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </div>
+        </div>
+
+        {loans.length === 0 ? (
+          <div className="empty-state">
+            <p>No loan applications found matching the selected status filter.</p>
+          </div>
+        ) : (
+          <div className="table-responsive">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Reference ID</th>
+                  <th>Applicant</th>
+                  <th>Type</th>
+                  <th>Amount (₹)</th>
+                  <th>Term &amp; Rate</th>
+                  <th>Purpose</th>
+                  <th>Status</th>
+                  <th>Review Notes / Reason</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loans.map((loan) => (
+                  <tr key={loan.id}>
+                    <td><strong>{loan.reference_id}</strong></td>
+                    <td>
+                      <div>{loan.applicant_name}</div>
+                      <small className="text-muted">@{loan.applicant_username} (ID: {loan.user_id})</small>
+                    </td>
+                    <td><span className="badge-type">{loan.loan_type.toUpperCase()}</span></td>
+                    <td>
+                      <strong>
+                        ₹{parseFloat(loan.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </strong>
+                    </td>
+                    <td>{loan.term_months} mos @ {loan.interest_rate}%</td>
+                    <td>{loan.purpose}</td>
+                    <td>
+                      <span className={`status-badge badge-${loan.status === 'approved' ? 'active' : loan.status === 'rejected' ? 'closed' : 'frozen'}`}>
+                        {loan.status.toUpperCase()}
+                      </span>
+                    </td>
+                    <td>
+                      {loan.status === 'rejected' && loan.rejection_reason ? (
+                        <span className="text-danger"><strong>Reason:</strong> {loan.rejection_reason}</span>
+                      ) : loan.decision_notes ? (
+                        <span>{loan.decision_notes}</span>
+                      ) : (
+                        <span className="text-muted">Pending review</span>
+                      )}
+                    </td>
+                    <td>
+                      {loan.status === 'pending' ? (
+                        <div className="action-buttons">
+                          <button
+                            className="btn btn-success btn-xs"
+                            disabled={loanActionLoading}
+                            onClick={() => handleApproveLoan(loan)}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            className="btn btn-danger btn-xs"
+                            disabled={loanActionLoading}
+                            onClick={() => {
+                              setRejectingLoan(loan);
+                              setRejectionReason('');
+                            }}
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      ) : (
+                        <small className="text-muted">
+                          By @{loan.reviewer_username || 'officer'}
+                        </small>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       {showCreateModal && (
         <div className="modal-overlay">
           <div className="modal-content">
@@ -246,6 +430,44 @@ export const EmployeeDashboard = () => {
                 </button>
                 <button type="submit" className="btn btn-primary" disabled={actionLoading}>
                   {actionLoading ? 'Creating...' : 'Create Account'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {rejectingLoan && (
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <h3>Reject Loan Application ({rejectingLoan.reference_id})</h3>
+            <p className="subtitle">
+              Applicant: {rejectingLoan.applicant_name} &bull; Amount: ₹{rejectingLoan.amount}
+            </p>
+            <form onSubmit={handleRejectLoanSubmit}>
+              <div className="form-group">
+                <label>Rejection Reason (Required)</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder="e.g. Insufficient credit history or income verification"
+                  value={rejectionReason}
+                  onChange={(e) => setRejectionReason(e.target.value)}
+                  disabled={loanActionLoading}
+                  required
+                />
+              </div>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => setRejectingLoan(null)}
+                  disabled={loanActionLoading}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-danger" disabled={loanActionLoading}>
+                  {loanActionLoading ? 'Rejecting...' : 'Confirm Rejection'}
                 </button>
               </div>
             </form>
