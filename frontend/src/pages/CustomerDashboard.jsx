@@ -6,6 +6,7 @@ import { useAuth } from '../context/AuthContext';
 export const CustomerDashboard = () => {
   const { user } = useAuth();
   const [accounts, setAccounts] = useState([]);
+  const [loans, setLoans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -22,26 +23,43 @@ export const CustomerDashboard = () => {
   const [transferError, setTransferError] = useState('');
   const [transferLoading, setTransferLoading] = useState(false);
 
-  const fetchAccounts = async () => {
+  // Loan application modal states (Issues #10 & #12)
+  const [showLoanModal, setShowLoanModal] = useState(false);
+  const [loanType, setLoanType] = useState('personal');
+  const [loanAmount, setLoanAmount] = useState('');
+  const [loanTermMonths, setLoanTermMonths] = useState('12');
+  const [loanAccountId, setLoanAccountId] = useState('');
+  const [loanPurpose, setLoanPurpose] = useState('');
+  const [loanError, setLoanError] = useState('');
+  const [loanLoading, setLoanLoading] = useState(false);
+
+  const fetchDashboardData = async () => {
     setLoading(true);
     setError('');
     try {
-      const data = await apiRequest('/api/accounts');
-      const list = data.accounts || [];
+      const [accData, loanData] = await Promise.all([
+        apiRequest('/api/accounts'),
+        apiRequest('/api/loans'),
+      ]);
+      const list = accData.accounts || [];
       setAccounts(list);
+      setLoans(loanData.loans || []);
       const firstActive = list.find((a) => a.status === 'active');
       if (firstActive && !transferSourceId) {
         setTransferSourceId(String(firstActive.id));
       }
+      if (firstActive && !loanAccountId) {
+        setLoanAccountId(String(firstActive.id));
+      }
     } catch (err) {
-      setError(err.message || 'Failed to load accounts.');
+      setError(err.message || 'Failed to load dashboard data.');
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchAccounts();
+    fetchDashboardData();
   }, []);
 
   const handleOpenAccount = async (e) => {
@@ -58,7 +76,7 @@ export const CustomerDashboard = () => {
         }),
       });
       setShowOpenModal(false);
-      await fetchAccounts();
+      await fetchDashboardData();
     } catch (err) {
       setError(err.message || 'Failed to open account.');
     } finally {
@@ -114,11 +132,64 @@ export const CustomerDashboard = () => {
       setTransferDestNumber('');
       setTransferAmount('');
       setTransferDesc('');
-      await fetchAccounts();
+      await fetchDashboardData();
     } catch (err) {
       setTransferError(err.message || 'Transfer failed.');
     } finally {
       setTransferLoading(false);
+    }
+  };
+
+  const openLoanModal = () => {
+    setLoanError('');
+    setSuccessMsg('');
+    setShowLoanModal(true);
+  };
+
+  const handleLoanSubmit = async (e) => {
+    e.preventDefault();
+    setLoanError('');
+    setSuccessMsg('');
+
+    const parsedAmount = parseFloat(loanAmount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      setLoanError('Please enter a valid loan amount greater than zero.');
+      return;
+    }
+    const parsedTerm = parseInt(loanTermMonths, 10);
+    if (isNaN(parsedTerm) || parsedTerm < 1 || parsedTerm > 360) {
+      setLoanError('Please enter a valid loan term between 1 and 360 months.');
+      return;
+    }
+    if (!loanPurpose.trim()) {
+      setLoanError('Please specify the purpose of the loan.');
+      return;
+    }
+
+    setLoanLoading(true);
+    try {
+      const data = await apiRequest('/api/loans', {
+        method: 'POST',
+        body: JSON.stringify({
+          loan_type: loanType,
+          amount: loanAmount,
+          term_months: parsedTerm,
+          account_id: loanAccountId ? parseInt(loanAccountId, 10) : null,
+          purpose: loanPurpose.trim(),
+        }),
+      });
+      const submittedLoan = data.loan;
+      setSuccessMsg(
+        `Loan application submitted! Reference ID: ${submittedLoan.reference_id} (Status: ${submittedLoan.status.toUpperCase()})`
+      );
+      setShowLoanModal(false);
+      setLoanAmount('');
+      setLoanPurpose('');
+      await fetchDashboardData();
+    } catch (err) {
+      setLoanError(err.message || 'Failed to submit loan application.');
+    } finally {
+      setLoanLoading(false);
     }
   };
 
@@ -129,7 +200,7 @@ export const CustomerDashboard = () => {
       <header className="page-header">
         <div>
           <h1>Welcome, {user?.full_name}</h1>
-          <p className="subtitle">Customer Portal &bull; Account Overview</p>
+          <p className="subtitle">Customer Portal &bull; Account &amp; Loan Overview</p>
         </div>
         <div className="action-buttons">
           {activeAccounts.length > 0 && (
@@ -137,6 +208,9 @@ export const CustomerDashboard = () => {
               &#8644; Transfer Funds
             </button>
           )}
+          <button className="btn btn-outline" onClick={openLoanModal}>
+            + Apply for Loan
+          </button>
           <button className="btn btn-primary" onClick={() => setShowOpenModal(true)}>
             + Open Savings Account
           </button>
@@ -184,6 +258,69 @@ export const CustomerDashboard = () => {
           ))}
         </div>
       )}
+
+      {/* Loan Applications Section (Issues #10 & #12) */}
+      <section style={{ marginTop: '2.5rem' }}>
+        <div className="page-header" style={{ marginBottom: '1rem' }}>
+          <div>
+            <h2>My Loan Applications</h2>
+            <p className="subtitle">Track your submitted loan applications and approval status</p>
+          </div>
+        </div>
+
+        {loans.length === 0 ? (
+          <div className="empty-state">
+            <p>You have not submitted any loan applications yet.</p>
+          </div>
+        ) : (
+          <div className="table-responsive">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Reference ID</th>
+                  <th>Loan Type</th>
+                  <th>Amount (₹)</th>
+                  <th>Term &amp; Rate</th>
+                  <th>Linked A/C</th>
+                  <th>Purpose</th>
+                  <th>Status</th>
+                  <th>Officer Decision / Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loans.map((loan) => (
+                  <tr key={loan.id}>
+                    <td><strong>{loan.reference_id}</strong></td>
+                    <td><span className="badge-type">{loan.loan_type.toUpperCase()}</span></td>
+                    <td>
+                      <strong>
+                        ₹{parseFloat(loan.amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </strong>
+                    </td>
+                    <td>{loan.term_months} mos @ {loan.interest_rate}%</td>
+                    <td>{loan.account_number ? `#${loan.account_number}` : '—'}</td>
+                    <td>{loan.purpose}</td>
+                    <td>
+                      <span className={`status-badge badge-${loan.status === 'approved' ? 'active' : loan.status === 'rejected' ? 'closed' : 'frozen'}`}>
+                        {loan.status.toUpperCase()}
+                      </span>
+                    </td>
+                    <td>
+                      {loan.status === 'rejected' && loan.rejection_reason ? (
+                        <span className="text-danger"><strong>Reason:</strong> {loan.rejection_reason}</span>
+                      ) : loan.decision_notes ? (
+                        <span>{loan.decision_notes}</span>
+                      ) : (
+                        <span className="text-muted">Awaiting officer review</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       {showOpenModal && (
         <div className="modal-overlay">
@@ -300,6 +437,107 @@ export const CustomerDashboard = () => {
                 </button>
                 <button type="submit" className="btn btn-primary" disabled={transferLoading}>
                   {transferLoading ? 'Transferring...' : 'Confirm Transfer'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showLoanModal && (
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <h3>Apply for a Bank Loan</h3>
+            <p className="subtitle">Submit an online loan application for review by a bank loan officer.</p>
+            {loanError && <div className="alert alert-danger">{loanError}</div>}
+            <form onSubmit={handleLoanSubmit}>
+              <div className="form-group">
+                <label>Loan Type</label>
+                <select
+                  className="input-control"
+                  value={loanType}
+                  onChange={(e) => setLoanType(e.target.value)}
+                  disabled={loanLoading}
+                >
+                  <option value="personal">Personal Loan (11.5% p.a.)</option>
+                  <option value="home">Home Loan (8.5% p.a.)</option>
+                  <option value="education">Education Loan (9.0% p.a.)</option>
+                  <option value="vehicle">Vehicle Loan (9.5% p.a.)</option>
+                  <option value="business">Business Loan (12.0% p.a.)</option>
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label>Requested Amount (₹)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="1"
+                  className="input-control"
+                  placeholder="e.g. 50000.00"
+                  value={loanAmount}
+                  onChange={(e) => setLoanAmount(e.target.value)}
+                  disabled={loanLoading}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Repayment Term (Months)</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="360"
+                  className="input-control"
+                  placeholder="e.g. 24"
+                  value={loanTermMonths}
+                  onChange={(e) => setLoanTermMonths(e.target.value)}
+                  disabled={loanLoading}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Linked Active Account (Optional)</label>
+                <select
+                  className="input-control"
+                  value={loanAccountId}
+                  onChange={(e) => setLoanAccountId(e.target.value)}
+                  disabled={loanLoading}
+                >
+                  <option value="">-- No linked account --</option>
+                  {activeAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      #{a.account_number} ({a.account_type.toUpperCase()}) — Bal: ₹{a.balance}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label>Loan Purpose</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder="Describe the purpose of the loan"
+                  value={loanPurpose}
+                  onChange={(e) => setLoanPurpose(e.target.value)}
+                  disabled={loanLoading}
+                  required
+                />
+              </div>
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => setShowLoanModal(false)}
+                  disabled={loanLoading}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={loanLoading}>
+                  {loanLoading ? 'Submitting...' : 'Submit Application'}
                 </button>
               </div>
             </form>

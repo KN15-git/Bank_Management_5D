@@ -1,4 +1,4 @@
--- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9)
+-- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9, #10, #11, #12)
 -- Enforces PRAGMA foreign_keys = ON
 
 CREATE TABLE IF NOT EXISTS users (
@@ -54,6 +54,28 @@ CREATE TABLE IF NOT EXISTS transfers (
     CHECK (source_account_id != destination_account_id)
 );
 
+CREATE TABLE IF NOT EXISTS loans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_id TEXT UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL,
+    account_id INTEGER NULL,
+    loan_type TEXT NOT NULL DEFAULT 'personal' CHECK (loan_type IN ('personal', 'home', 'education', 'vehicle', 'business')),
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    term_months INTEGER NOT NULL CHECK (term_months > 0),
+    interest_rate REAL NOT NULL DEFAULT 10.5 CHECK (interest_rate > 0),
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    reviewed_by INTEGER NULL,
+    rejection_reason TEXT NULL,
+    decision_notes TEXT NULL,
+    reviewed_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE RESTRICT,
+    FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE RESTRICT,
+    FOREIGN KEY (reviewed_by) REFERENCES users (id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NULL,
@@ -73,3 +95,6 @@ CREATE INDEX IF NOT EXISTS idx_transactions_reference_id ON transactions(referen
 CREATE INDEX IF NOT EXISTS idx_transfers_source_account_id ON transfers(source_account_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_destination_account_id ON transfers(destination_account_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_reference_id ON transfers(reference_id);
+CREATE INDEX IF NOT EXISTS idx_loans_user_id ON loans(user_id);
+CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status);
+CREATE INDEX IF NOT EXISTS idx_loans_reference_id ON loans(reference_id);
