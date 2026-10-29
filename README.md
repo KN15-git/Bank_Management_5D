@@ -13,13 +13,26 @@ Academic Software Engineering Mini-Project — Bank Management System implementa
 - **Issue #7**: Transaction Validation & Recording (Atomic transaction processing, unique reference ID generation, persistent transaction ledger storing amount, type, resulting balance, and timestamp).
 - **Issue #8**: Fund Transfer Between Accounts (Transfer funds from a source account to a destination account by 12-digit account number or ID, validating source ownership, active account statuses, non-self transfer, and sufficient balance, while recording `transfer_out` and `transfer_in` ledger entries plus transfer records).
 - **Issue #9**: Atomic Transfer & Rollback (All-or-nothing execution across source debit, destination credit, transaction ledger entries, and transfer record; automatic `ROLLBACK` on any failure so accounts and ledgers never enter an inconsistent state).
+- **Issue #10**: Loan Application (Submit loan applications for personal, home, education, vehicle, business loans with validation and unique reference ID generation).
+- **Issue #11**: Loan Application Review (Loan officers can view and review submitted loan applications, filter by status, with customer ownership isolation).
+- **Issue #12**: Loan Approval / Rejection & Status (Loan officers can approve or reject applications with mandatory rejection reason enforcement, logging decisions and updating status).
+- **Issue #13**: Transaction History (Chronological transaction ledger with transaction reference IDs, types, amounts, and resulting balances).
+- **Issue #14**: Transaction Filtering & Pagination (Search, filter by transaction type and inclusive dates, sort order, and server-side pagination).
+- **Issue #15**: Transaction Statement / Export (Export transaction statements as CSV with spreadsheet formula injection escaping).
+- **Issue #16**: Transaction & Loan Notifications (Real-time in-app and simulated alerts for deposits, withdrawals, transfers, and loan application approvals/rejections with rejection reason inclusion, unread counter badges, mark-read, and delivery SLA under 1 minute).
+- **Issue #17**: Beneficiary Management (Add, view, manage, and delete eligible beneficiary accounts with transfer limit enforcement).
+- **Issue #19**: Data Security and Role Access (HTTP security headers, cache protection headers, password hashing integrity, strict RBAC).
+- **Issue #20**: System Response Time (Real-time latency profiling middleware with `Server-Timing` and `X-Response-Time` headers, sub-second execution).
+- **Issue #21**: System Availability and Reliability (Liveness and readiness probes `/api/health`, `/api/health/ready`, SQLite busy timeout resilience, safe request teardown rollback).
+- **Issue #24**: Backup and Recovery (Online atomic SQLite backups via official backup API, SHA-256 cryptographic verification, PRAGMA integrity check, pre-restore safety snapshots, disaster recovery restoration, and CLI/API tooling complying with SEC-07 and SEC-10).
 
 ---
 
 ## 2. Tech Stack
 - **Backend**: Python 3.10+, Flask REST API, Flask-Login, Flask-CORS, bcrypt, SQLite (`PRAGMA foreign_keys = ON;`)
 - **Frontend**: React 18, React Router v6, Plain CSS, Vite dev server with proxy
-- **Testing**: pytest (32 test cases passing), Postman Collection
+- **Testing**: pytest (67 test cases passing), Postman Collection
+
 
 ---
 

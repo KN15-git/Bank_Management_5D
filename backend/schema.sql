@@ -1,4 +1,4 @@
--- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9, #10, #11, #12, #17)
+-- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9, #10, #11, #12, #16, #17, #24)
 -- Enforces PRAGMA foreign_keys = ON
 
 CREATE TABLE IF NOT EXISTS users (
@@ -102,6 +102,35 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    notification_type TEXT NOT NULL CHECK (notification_type IN ('transaction', 'loan', 'security', 'system')),
+    event_type TEXT NOT NULL,
+    reference_id TEXT NULL,
+    channel TEXT NOT NULL DEFAULT 'in_app' CHECK (channel IN ('in_app', 'email', 'sms')),
+    is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT UNIQUE NOT NULL,
+    filepath TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual', 'scheduled', 'pre_restore_safety')),
+    status TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'corrupted', 'restored')),
+    tables_summary TEXT,
+    created_by INTEGER NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    restored_at TIMESTAMP NULL,
+    FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
@@ -116,3 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status);
 CREATE INDEX IF NOT EXISTS idx_loans_reference_id ON loans(reference_id);
 CREATE INDEX IF NOT EXISTS idx_beneficiaries_user_id ON beneficiaries(user_id);
 CREATE INDEX IF NOT EXISTS idx_beneficiaries_account_number ON beneficiaries(account_number);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_backups_created_at ON backups(created_at);
