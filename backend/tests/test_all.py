@@ -1095,3 +1095,158 @@ def test_issue_12_loan_approval_and_rejection_workflow(client):
     )
     assert re_decide.status_code == 400
     assert "already been processed" in re_decide.get_json()["error"]
+
+
+# ==============================================================================
+# ISSUE #17: BENEFICIARY MANAGEMENT TESTS
+# ==============================================================================
+def test_issue_17_add_list_update_delete_beneficiary_success(client):
+    """Issue #17: Customer can add, list, search, update, and remove a saved beneficiary."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # 1. Add cust2's account (200000000001) as a beneficiary
+    add_res = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "beneficiary_name": "Customer Two",
+            "account_number": "200000000001",
+            "nickname": "Partner",
+            "max_transfer_limit": "500.00",
+        },
+    )
+    assert add_res.status_code == 201
+    ben = add_res.get_json()["beneficiary"]
+    assert ben["beneficiary_name"] == "Customer Two"
+    assert ben["account_number"] == "200000000001"
+    assert ben["nickname"] == "Partner"
+    assert ben["max_transfer_limit"] == "500.00"
+    assert ben["max_transfer_limit_paise"] == 50000
+    assert ben["is_verified"] is True
+    ben_id = ben["id"]
+
+    # 2. List and search beneficiaries
+    list_res = client.get("/api/beneficiaries?search=partner")
+    assert list_res.status_code == 200
+    bens = list_res.get_json()["beneficiaries"]
+    assert len(bens) == 1
+    assert bens[0]["id"] == ben_id
+
+    # 3. Update beneficiary nickname and limit
+    patch_res = client.patch(
+        f"/api/beneficiaries/{ben_id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"nickname": "Trusted Partner", "max_transfer_limit": "800.00"},
+    )
+    assert patch_res.status_code == 200
+    updated_ben = patch_res.get_json()["beneficiary"]
+    assert updated_ben["nickname"] == "Trusted Partner"
+    assert updated_ben["max_transfer_limit"] == "800.00"
+
+    # 4. Delete beneficiary
+    del_res = client.delete(f"/api/beneficiaries/{ben_id}", headers={"X-CSRF-Token": csrf})
+    assert del_res.status_code == 200
+    assert len(client.get("/api/beneficiaries").get_json()["beneficiaries"]) == 0
+
+
+def test_issue_17_beneficiary_validation_and_duplicate_prevention(client):
+    """Issue #17: Rejects self-beneficiary, non-existent accounts, invalid IFSC/limits, and duplicates."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    # Missing beneficiary name
+    assert client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "  ", "account_number": "200000000001"},
+    ).status_code == 400
+
+    # Non-existent account number
+    assert client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "Ghost User", "account_number": "999999999999"},
+    ).status_code == 404
+
+    # Adding own account as beneficiary must be blocked (400)
+    self_ben = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "My Own Account", "account_number": "100000000001"},
+    )
+    assert self_ben.status_code == 400
+    assert "own account" in self_ben.get_json()["error"]
+
+    # Invalid IFSC code format
+    bad_ifsc = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "Customer Two", "account_number": "200000000001", "ifsc_code": "BADIFSC"},
+    )
+    assert bad_ifsc.status_code == 400
+
+    # Valid beneficiary creation followed by duplicate attempt (409 Conflict)
+    ok_res = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "Customer Two", "account_number": "200000000001"},
+    )
+    assert ok_res.status_code == 201
+
+    dup_res = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf},
+        json={"beneficiary_name": "Customer Two Duplicate", "account_number": "200000000001"},
+    )
+    assert dup_res.status_code == 409
+
+
+def test_issue_17_beneficiary_ownership_isolation_and_transfer_integration(client):
+    """
+    Issue #17: Enforces RBAC ownership isolation across customers and supports transferring
+    directly to a saved beneficiary while enforcing the configured max_transfer_limit.
+    """
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf1 = client.get("/api/auth/csrf").get_json()["csrf_token"]
+
+    ben = client.post(
+        "/api/beneficiaries",
+        headers={"X-CSRF-Token": csrf1},
+        json={
+            "beneficiary_name": "Customer Two",
+            "account_number": "200000000001",
+            "max_transfer_limit": "400.00",
+        },
+    ).get_json()["beneficiary"]
+    ben_id = ben["id"]
+
+    # Transfer exceeding beneficiary max_transfer_limit (400.00) must be rejected
+    over_limit = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf1},
+        json={"beneficiary_id": ben_id, "amount": "450.00", "description": "Over beneficiary limit"},
+    )
+    assert over_limit.status_code == 400
+    assert "beneficiary limit" in over_limit.get_json()["error"]
+
+    # Transfer within beneficiary max_transfer_limit succeeds using beneficiary_id
+    ok_transfer = client.post(
+        "/api/accounts/1/transfer",
+        headers={"X-CSRF-Token": csrf1},
+        json={"beneficiary_id": ben_id, "amount": "250.00", "description": "Beneficiary transfer"},
+    )
+    assert ok_transfer.status_code == 201
+    assert ok_transfer.get_json()["transfer"]["destination_account_number"] == "200000000001"
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf1})
+
+    # cust2 cannot access, modify, or delete cust1's beneficiary (403 Forbidden)
+    client.post("/api/auth/login", json={"username": "cust2", "password": "CustPass2"})
+    csrf2 = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    assert client.get(f"/api/beneficiaries/{ben_id}").status_code == 403
+    assert client.patch(
+        f"/api/beneficiaries/{ben_id}",
+        headers={"X-CSRF-Token": csrf2},
+        json={"nickname": "Hijacked"},
+    ).status_code == 403
+    assert client.delete(f"/api/beneficiaries/{ben_id}", headers={"X-CSRF-Token": csrf2}).status_code == 403
