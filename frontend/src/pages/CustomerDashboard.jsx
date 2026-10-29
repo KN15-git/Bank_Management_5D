@@ -7,6 +7,7 @@ export const CustomerDashboard = () => {
   const { user } = useAuth();
   const [accounts, setAccounts] = useState([]);
   const [loans, setLoans] = useState([]);
+  const [beneficiaries, setBeneficiaries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -14,14 +15,24 @@ export const CustomerDashboard = () => {
   const [initialDeposit, setInitialDeposit] = useState('1000.00');
   const [modalLoading, setModalLoading] = useState(false);
 
-  // Fund transfer modal states (Issues #8 & #9)
+  // Fund transfer modal states (Issues #8, #9, #17)
   const [showTransferModal, setShowTransferModal] = useState(false);
   const [transferSourceId, setTransferSourceId] = useState('');
+  const [selectedBeneficiaryId, setSelectedBeneficiaryId] = useState('');
   const [transferDestNumber, setTransferDestNumber] = useState('');
   const [transferAmount, setTransferAmount] = useState('');
   const [transferDesc, setTransferDesc] = useState('');
   const [transferError, setTransferError] = useState('');
   const [transferLoading, setTransferLoading] = useState(false);
+
+  // Beneficiary modal states (Issue #17)
+  const [showBeneficiaryModal, setShowBeneficiaryModal] = useState(false);
+  const [benName, setBenName] = useState('');
+  const [benAccountNum, setBenAccountNum] = useState('');
+  const [benNickname, setBenNickname] = useState('');
+  const [benMaxLimit, setBenMaxLimit] = useState('');
+  const [benError, setBenError] = useState('');
+  const [benLoading, setBenLoading] = useState(false);
 
   // Loan application modal states (Issues #10 & #12)
   const [showLoanModal, setShowLoanModal] = useState(false);
@@ -37,13 +48,15 @@ export const CustomerDashboard = () => {
     setLoading(true);
     setError('');
     try {
-      const [accData, loanData] = await Promise.all([
+      const [accData, loanData, benData] = await Promise.all([
         apiRequest('/api/accounts'),
         apiRequest('/api/loans'),
+        apiRequest('/api/beneficiaries'),
       ]);
       const list = accData.accounts || [];
       setAccounts(list);
       setLoans(loanData.loans || []);
+      setBeneficiaries(benData.beneficiaries || []);
       const firstActive = list.find((a) => a.status === 'active');
       if (firstActive && !transferSourceId) {
         setTransferSourceId(String(firstActive.id));
@@ -84,14 +97,31 @@ export const CustomerDashboard = () => {
     }
   };
 
-  const openTransferModal = () => {
+  const openTransferModal = (prefillBeneficiary = null) => {
     const activeAccs = accounts.filter((a) => a.status === 'active');
     if (activeAccs.length > 0 && !transferSourceId) {
       setTransferSourceId(String(activeAccs[0].id));
     }
+    if (prefillBeneficiary) {
+      setSelectedBeneficiaryId(String(prefillBeneficiary.id));
+      setTransferDestNumber(prefillBeneficiary.account_number);
+    } else {
+      setSelectedBeneficiaryId('');
+    }
     setTransferError('');
     setSuccessMsg('');
     setShowTransferModal(true);
+  };
+
+  const handleBeneficiarySelect = (e) => {
+    const val = e.target.value;
+    setSelectedBeneficiaryId(val);
+    if (val) {
+      const found = beneficiaries.find((b) => String(b.id) === String(val));
+      if (found) {
+        setTransferDestNumber(found.account_number);
+      }
+    }
   };
 
   const handleTransferSubmit = async (e) => {
@@ -104,8 +134,8 @@ export const CustomerDashboard = () => {
       return;
     }
     const cleanDest = transferDestNumber.trim();
-    if (!cleanDest) {
-      setTransferError('Please enter a destination account number.');
+    if (!cleanDest && !selectedBeneficiaryId) {
+      setTransferError('Please enter a destination account number or select a saved beneficiary.');
       return;
     }
     const parsedAmount = parseFloat(transferAmount);
@@ -116,19 +146,24 @@ export const CustomerDashboard = () => {
 
     setTransferLoading(true);
     try {
+      const payload = {
+        destination_account_number: cleanDest,
+        amount: transferAmount,
+        description: transferDesc,
+      };
+      if (selectedBeneficiaryId) {
+        payload.beneficiary_id = parseInt(selectedBeneficiaryId, 10);
+      }
       const data = await apiRequest(`/api/accounts/${transferSourceId}/transfer`, {
         method: 'POST',
-        body: JSON.stringify({
-          destination_account_number: cleanDest,
-          amount: transferAmount,
-          description: transferDesc,
-        }),
+        body: JSON.stringify(payload),
       });
       const trf = data.transfer || data.transaction;
       setSuccessMsg(
         `Transferred ₹${trf.amount} from A/C #${trf.source_account_number} to A/C #${trf.destination_account_number} (Ref: ${trf.reference_id})`
       );
       setShowTransferModal(false);
+      setSelectedBeneficiaryId('');
       setTransferDestNumber('');
       setTransferAmount('');
       setTransferDesc('');
@@ -137,6 +172,67 @@ export const CustomerDashboard = () => {
       setTransferError(err.message || 'Transfer failed.');
     } finally {
       setTransferLoading(false);
+    }
+  };
+
+  const openBeneficiaryModal = () => {
+    setBenError('');
+    setSuccessMsg('');
+    setShowBeneficiaryModal(true);
+  };
+
+  const handleBeneficiarySubmit = async (e) => {
+    e.preventDefault();
+    setBenError('');
+    setSuccessMsg('');
+
+    if (!benName.trim()) {
+      setBenError('Please enter the beneficiary name.');
+      return;
+    }
+    if (!benAccountNum.trim()) {
+      setBenError('Please enter the beneficiary account number.');
+      return;
+    }
+
+    setBenLoading(true);
+    try {
+      const data = await apiRequest('/api/beneficiaries', {
+        method: 'POST',
+        body: JSON.stringify({
+          beneficiary_name: benName.trim(),
+          account_number: benAccountNum.trim(),
+          nickname: benNickname.trim() || null,
+          max_transfer_limit: benMaxLimit.trim() || null,
+        }),
+      });
+      setSuccessMsg(
+        `Added beneficiary "${data.beneficiary.beneficiary_name}" (A/C #${data.beneficiary.account_number}).`
+      );
+      setShowBeneficiaryModal(false);
+      setBenName('');
+      setBenAccountNum('');
+      setBenNickname('');
+      setBenMaxLimit('');
+      await fetchDashboardData();
+    } catch (err) {
+      setBenError(err.message || 'Failed to add beneficiary.');
+    } finally {
+      setBenLoading(false);
+    }
+  };
+
+  const handleDeleteBeneficiary = async (ben) => {
+    setError('');
+    setSuccessMsg('');
+    try {
+      await apiRequest(`/api/beneficiaries/${ben.id}`, {
+        method: 'DELETE',
+      });
+      setSuccessMsg(`Removed beneficiary "${ben.beneficiary_name}" (A/C #${ben.account_number}).`);
+      await fetchDashboardData();
+    } catch (err) {
+      setError(err.message || 'Failed to remove beneficiary.');
     }
   };
 
@@ -200,14 +296,17 @@ export const CustomerDashboard = () => {
       <header className="page-header">
         <div>
           <h1>Welcome, {user?.full_name}</h1>
-          <p className="subtitle">Customer Portal &bull; Account &amp; Loan Overview</p>
+          <p className="subtitle">Customer Portal &bull; Account, Beneficiary &amp; Loan Overview</p>
         </div>
         <div className="action-buttons">
           {activeAccounts.length > 0 && (
-            <button className="btn btn-outline" onClick={openTransferModal}>
+            <button className="btn btn-outline" onClick={() => openTransferModal()}>
               &#8644; Transfer Funds
             </button>
           )}
+          <button className="btn btn-outline" onClick={openBeneficiaryModal}>
+            + Add Beneficiary
+          </button>
           <button className="btn btn-outline" onClick={openLoanModal}>
             + Apply for Loan
           </button>
@@ -258,6 +357,70 @@ export const CustomerDashboard = () => {
           ))}
         </div>
       )}
+
+      {/* Saved Beneficiaries Section (Issue #17) */}
+      <section style={{ marginTop: '2.5rem' }}>
+        <div className="page-header" style={{ marginBottom: '1rem' }}>
+          <div>
+            <h2>Saved Beneficiaries</h2>
+            <p className="subtitle">Manage verified payees for quick and secure fund transfers</p>
+          </div>
+        </div>
+
+        {beneficiaries.length === 0 ? (
+          <div className="empty-state">
+            <p>You have not saved any beneficiaries yet. Add a beneficiary to speed up future transfers.</p>
+          </div>
+        ) : (
+          <div className="table-responsive">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Beneficiary Name</th>
+                  <th>Nickname</th>
+                  <th>Account Number</th>
+                  <th>Bank &amp; IFSC</th>
+                  <th>Per-Transfer Limit</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {beneficiaries.map((ben) => (
+                  <tr key={ben.id}>
+                    <td><strong>{ben.beneficiary_name}</strong></td>
+                    <td>{ben.nickname || '—'}</td>
+                    <td><strong>{ben.account_number}</strong></td>
+                    <td>{ben.bank_name} ({ben.ifsc_code})</td>
+                    <td>
+                      {ben.max_transfer_limit
+                        ? `₹${parseFloat(ben.max_transfer_limit).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : 'No Limit'}
+                    </td>
+                    <td>
+                      <div className="action-buttons">
+                        {activeAccounts.length > 0 && (
+                          <button
+                            className="btn btn-primary btn-xs"
+                            onClick={() => openTransferModal(ben)}
+                          >
+                            Send Money
+                          </button>
+                        )}
+                        <button
+                          className="btn btn-danger btn-xs"
+                          onClick={() => handleDeleteBeneficiary(ben)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       {/* Loan Applications Section (Issues #10 & #12) */}
       <section style={{ marginTop: '2.5rem' }}>
@@ -366,7 +529,7 @@ export const CustomerDashboard = () => {
         <div className="modal-overlay">
           <div className="modal-content">
             <h3>Transfer Funds Between Accounts</h3>
-            <p className="subtitle">Atomic transfer from your active account to any active destination account.</p>
+            <p className="subtitle">Atomic transfer from your active account to a saved beneficiary or destination account.</p>
             {transferError && <div className="alert alert-danger">{transferError}</div>}
             <form onSubmit={handleTransferSubmit}>
               <div className="form-group">
@@ -385,6 +548,25 @@ export const CustomerDashboard = () => {
                   ))}
                 </select>
               </div>
+
+              {beneficiaries.length > 0 && (
+                <div className="form-group">
+                  <label>Select Saved Beneficiary (Optional)</label>
+                  <select
+                    className="input-control"
+                    value={selectedBeneficiaryId}
+                    onChange={handleBeneficiarySelect}
+                    disabled={transferLoading}
+                  >
+                    <option value="">-- Enter account number manually --</option>
+                    {beneficiaries.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.beneficiary_name} {b.nickname ? `(${b.nickname})` : ''} — #{b.account_number}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               <div className="form-group">
                 <label>Destination Account Number</label>
@@ -437,6 +619,83 @@ export const CustomerDashboard = () => {
                 </button>
                 <button type="submit" className="btn btn-primary" disabled={transferLoading}>
                   {transferLoading ? 'Transferring...' : 'Confirm Transfer'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showBeneficiaryModal && (
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <h3>Add New Beneficiary</h3>
+            <p className="subtitle">Save a verified recipient account for quick and secure transfers.</p>
+            {benError && <div className="alert alert-danger">{benError}</div>}
+            <form onSubmit={handleBeneficiarySubmit}>
+              <div className="form-group">
+                <label>Beneficiary Full Name</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder="e.g. Anita Suresh"
+                  value={benName}
+                  onChange={(e) => setBenName(e.target.value)}
+                  disabled={benLoading}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>12-Digit Account Number</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder="e.g. 200987654321"
+                  value={benAccountNum}
+                  onChange={(e) => setBenAccountNum(e.target.value)}
+                  disabled={benLoading}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Nickname (Optional)</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder="e.g. Sister, Landlord"
+                  value={benNickname}
+                  onChange={(e) => setBenNickname(e.target.value)}
+                  disabled={benLoading}
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Max Per-Transfer Limit in ₹ (Optional)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="1"
+                  className="input-control"
+                  placeholder="Leave blank for no per-transfer limit"
+                  value={benMaxLimit}
+                  onChange={(e) => setBenMaxLimit(e.target.value)}
+                  disabled={benLoading}
+                />
+              </div>
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => setShowBeneficiaryModal(false)}
+                  disabled={benLoading}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={benLoading}>
+                  {benLoading ? 'Saving...' : 'Save Beneficiary'}
                 </button>
               </div>
             </form>

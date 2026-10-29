@@ -1,4 +1,4 @@
--- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9, #10, #11, #12)
+-- Bank Management System Database Schema (Issues #2, #3, #4, #5, #6, #7, #8, #9, #10, #11, #12, #17)
 -- Enforces PRAGMA foreign_keys = ON
 
 CREATE TABLE IF NOT EXISTS users (
@@ -76,6 +76,22 @@ CREATE TABLE IF NOT EXISTS loans (
     FOREIGN KEY (reviewed_by) REFERENCES users (id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS beneficiaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    beneficiary_name TEXT NOT NULL,
+    account_number TEXT NOT NULL,
+    bank_name TEXT NOT NULL DEFAULT 'PES Bank',
+    ifsc_code TEXT NOT NULL DEFAULT 'PESB0000001',
+    nickname TEXT NULL,
+    max_transfer_limit INTEGER NULL CHECK (max_transfer_limit IS NULL OR max_transfer_limit > 0),
+    is_verified INTEGER NOT NULL DEFAULT 1 CHECK (is_verified IN (0, 1)),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (user_id, account_number)
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NULL,
@@ -98,3 +114,5 @@ CREATE INDEX IF NOT EXISTS idx_transfers_reference_id ON transfers(reference_id)
 CREATE INDEX IF NOT EXISTS idx_loans_user_id ON loans(user_id);
 CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status);
 CREATE INDEX IF NOT EXISTS idx_loans_reference_id ON loans(reference_id);
+CREATE INDEX IF NOT EXISTS idx_beneficiaries_user_id ON beneficiaries(user_id);
+CREATE INDEX IF NOT EXISTS idx_beneficiaries_account_number ON beneficiaries(account_number);

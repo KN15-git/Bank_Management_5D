@@ -913,6 +913,7 @@ def execute_transfer(
     amount_rupees: str = None,
     description: str = None,
     source_account_number: str = None,
+    beneficiary_id: int = None,
     _simulate_failure_after_debit: bool = False,
 ):
     """
@@ -965,7 +966,24 @@ def execute_transfer(
     if source_acc["status"] == AccountStatus.CLOSED.value:
         return None, "Cannot perform transactions on a closed account.", 400
 
-    # 2. Resolve and validate destination account
+    # 2. Resolve and validate destination account (or saved beneficiary #17)
+    beneficiary_row = None
+    if beneficiary_id is not None and str(beneficiary_id).strip() != "":
+        try:
+            ben_id_int = int(beneficiary_id)
+        except (ValueError, TypeError):
+            return None, "Invalid beneficiary_id", 400
+        cursor.execute(
+            "SELECT id, user_id, beneficiary_name, account_number, max_transfer_limit, is_verified FROM beneficiaries WHERE id = ?",
+            (ben_id_int,),
+        )
+        beneficiary_row = cursor.fetchone()
+        if not beneficiary_row:
+            return None, "Beneficiary not found", 404
+        if beneficiary_row["user_id"] != user.id and user.role == Role.CUSTOMER.value:
+            return None, "Access forbidden: you do not own this beneficiary", 403
+        destination_account_number = beneficiary_row["account_number"]
+
     dest_acc = None
     if destination_account_number is not None and str(destination_account_number).strip() != "":
         dest_num_clean = str(destination_account_number).strip()
@@ -989,6 +1007,21 @@ def execute_transfer(
 
     if not dest_acc:
         return None, "Destination account not found", 404
+
+    # Enforce saved beneficiary per-transfer limit if configured (#17)
+    if beneficiary_row is None:
+        cursor.execute(
+            "SELECT id, max_transfer_limit FROM beneficiaries WHERE user_id = ? AND account_number = ?",
+            (source_acc["user_id"], dest_acc["account_number"]),
+        )
+        beneficiary_row = cursor.fetchone()
+    if beneficiary_row and beneficiary_row["max_transfer_limit"] is not None:
+        if amount_paise > beneficiary_row["max_transfer_limit"]:
+            return (
+                None,
+                f"Transfer amount exceeds the configured beneficiary limit of ₹{paise_to_rupees_str(beneficiary_row['max_transfer_limit'])}",
+                400,
+            )
 
     if source_acc["id"] == dest_acc["id"]:
         return None, "Cannot transfer funds to the same account.", 400
@@ -1666,6 +1699,310 @@ def review_loan_application(
 
 
 # ==============================================================================
+# 5D. BENEFICIARY MANAGEMENT SERVICES (#17)
+# ==============================================================================
+def _format_beneficiary_row(row) -> dict:
+    limit_paise = row["max_transfer_limit"]
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "beneficiary_name": row["beneficiary_name"],
+        "account_number": row["account_number"],
+        "bank_name": row["bank_name"],
+        "ifsc_code": row["ifsc_code"],
+        "nickname": row["nickname"],
+        "max_transfer_limit_paise": limit_paise,
+        "max_transfer_limit": paise_to_rupees_str(limit_paise) if limit_paise is not None else None,
+        "is_verified": bool(row["is_verified"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def add_beneficiary(
+    user,
+    beneficiary_name: str,
+    account_number: str,
+    nickname: str = None,
+    bank_name: str = "PES Bank",
+    ifsc_code: str = "PESB0000001",
+    max_transfer_limit_rupees=None,
+):
+    """
+    Issue #17: Add and verify a saved beneficiary for fund transfers.
+    Validates target account existence, prevents self-beneficiary or duplicate entries,
+    and optionally configures a per-transfer limit.
+    """
+    clean_name = (beneficiary_name or "").strip()
+    if not clean_name:
+        return None, "Beneficiary name is required", 400
+
+    clean_acc_num = (str(account_number).strip() if account_number is not None else "")
+    if not clean_acc_num:
+        return None, "Beneficiary account number is required", 400
+
+    clean_bank = (bank_name or "PES Bank").strip() or "PES Bank"
+    clean_ifsc = (ifsc_code or "PESB0000001").strip().upper() or "PESB0000001"
+    if not re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", clean_ifsc):
+        return None, "Invalid IFSC code format (expected 11-character code, e.g. PESB0000001)", 400
+
+    clean_nickname = (nickname or "").strip() or None
+
+    limit_paise = None
+    if max_transfer_limit_rupees is not None and str(max_transfer_limit_rupees).strip() != "":
+        try:
+            limit_paise = rupees_to_paise(max_transfer_limit_rupees)
+        except ValueError:
+            return None, "Invalid max_transfer_limit amount format", 400
+        if limit_paise <= 0:
+            return None, "max_transfer_limit must be greater than zero", 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    # Verify target account exists within the bank and is not closed
+    cursor.execute(
+        "SELECT id, account_number, user_id, status FROM accounts WHERE account_number = ?",
+        (clean_acc_num,),
+    )
+    target_acc = cursor.fetchone()
+    if not target_acc:
+        return None, "Beneficiary account number not found", 404
+
+    if target_acc["status"] == AccountStatus.CLOSED.value:
+        return None, "Cannot add a closed account as a beneficiary", 400
+
+    if target_acc["user_id"] == user.id:
+        return None, "Cannot add your own account as a beneficiary", 400
+
+    cursor.execute(
+        "SELECT id FROM beneficiaries WHERE user_id = ? AND account_number = ?",
+        (user.id, clean_acc_num),
+    )
+    if cursor.fetchone():
+        return None, "Beneficiary with this account number already exists", 409
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO beneficiaries (
+                user_id, beneficiary_name, account_number, bank_name,
+                ifsc_code, nickname, max_transfer_limit, is_verified
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                user.id,
+                clean_name,
+                clean_acc_num,
+                clean_bank,
+                clean_ifsc,
+                clean_nickname,
+                limit_paise,
+            ),
+        )
+        ben_id = cursor.lastrowid
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return None, "Beneficiary with this account number already exists", 409
+    except Exception as e:
+        db.rollback()
+        return None, f"Failed to add beneficiary: {str(e)}", 500
+
+    log_event(
+        "BENEFICIARY_ADDED",
+        user_id=user.id,
+        details=f"Added beneficiary '{clean_name}' (A/C {clean_acc_num})",
+    )
+    ben_dict, _, _ = get_beneficiary_by_id(user, ben_id)
+    return ben_dict, None, 201
+
+
+def get_beneficiaries(user, search: str = None, target_user_id: int = None):
+    """
+    Issue #17: List saved beneficiaries.
+    Customers see only their own beneficiaries; Employee/Admin can view own or filter by user_id.
+    """
+    db = get_db()
+    cursor = db.cursor()
+
+    conditions = []
+    params = []
+
+    if user.role == Role.CUSTOMER.value:
+        conditions.append("b.user_id = ?")
+        params.append(user.id)
+    elif target_user_id is not None:
+        conditions.append("b.user_id = ?")
+        params.append(int(target_user_id))
+
+    if search and str(search).strip():
+        term = f"%{str(search).strip().lower()}%"
+        conditions.append(
+            "(LOWER(b.beneficiary_name) LIKE ? OR LOWER(COALESCE(b.nickname, '')) LIKE ? OR LOWER(b.account_number) LIKE ?)"
+        )
+        params.extend([term, term, term])
+
+    query = """
+        SELECT b.id, b.user_id, b.beneficiary_name, b.account_number, b.bank_name,
+               b.ifsc_code, b.nickname, b.max_transfer_limit, b.is_verified,
+               b.created_at, b.updated_at
+        FROM beneficiaries b
+    """
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY b.id DESC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    return [_format_beneficiary_row(r) for r in rows], None, 200
+
+
+def get_beneficiary_by_id(user, beneficiary_id: int):
+    """Issue #17: Retrieve single beneficiary with ownership enforcement."""
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        """
+        SELECT id, user_id, beneficiary_name, account_number, bank_name,
+               ifsc_code, nickname, max_transfer_limit, is_verified,
+               created_at, updated_at
+        FROM beneficiaries
+        WHERE id = ?
+        """,
+        (beneficiary_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, "Beneficiary not found", 404
+
+    if user.role == Role.CUSTOMER.value and row["user_id"] != user.id:
+        log_event(
+            "UNAUTHORIZED_BENEFICIARY_ACCESS",
+            user_id=user.id,
+            details=f"Customer {user.username} attempted to access beneficiary id {beneficiary_id} owned by user_id {row['user_id']}",
+        )
+        return None, "Access forbidden: you do not own this beneficiary", 403
+
+    return _format_beneficiary_row(row), None, 200
+
+
+def update_beneficiary(user, beneficiary_id: int, data: dict):
+    """Issue #17: Update beneficiary details (name, nickname, bank_name, ifsc_code, max_transfer_limit)."""
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT id, user_id, beneficiary_name, account_number, bank_name, ifsc_code, nickname, max_transfer_limit FROM beneficiaries WHERE id = ?",
+        (beneficiary_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, "Beneficiary not found", 404
+
+    if user.role == Role.CUSTOMER.value and row["user_id"] != user.id:
+        log_event(
+            "UNAUTHORIZED_BENEFICIARY_ACCESS",
+            user_id=user.id,
+            details=f"Customer {user.username} attempted to update beneficiary id {beneficiary_id}",
+        )
+        return None, "Access forbidden: you do not own this beneficiary", 403
+
+    new_name = row["beneficiary_name"]
+    if "beneficiary_name" in data or "name" in data:
+        raw_name = data.get("beneficiary_name") if "beneficiary_name" in data else data.get("name")
+        clean_name = (raw_name or "").strip()
+        if not clean_name:
+            return None, "Beneficiary name cannot be empty", 400
+        new_name = clean_name
+
+    new_nickname = row["nickname"]
+    if "nickname" in data:
+        new_nickname = (data.get("nickname") or "").strip() or None
+
+    new_bank = row["bank_name"]
+    if "bank_name" in data:
+        clean_bank = (data.get("bank_name") or "").strip()
+        if not clean_bank:
+            return None, "bank_name cannot be empty", 400
+        new_bank = clean_bank
+
+    new_ifsc = row["ifsc_code"]
+    if "ifsc_code" in data:
+        clean_ifsc = (data.get("ifsc_code") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", clean_ifsc):
+            return None, "Invalid IFSC code format (expected 11-character code, e.g. PESB0000001)", 400
+        new_ifsc = clean_ifsc
+
+    new_limit = row["max_transfer_limit"]
+    if "max_transfer_limit" in data:
+        raw_limit = data.get("max_transfer_limit")
+        if raw_limit is None or str(raw_limit).strip() == "":
+            new_limit = None
+        else:
+            try:
+                new_limit = rupees_to_paise(raw_limit)
+            except ValueError:
+                return None, "Invalid max_transfer_limit amount format", 400
+            if new_limit <= 0:
+                return None, "max_transfer_limit must be greater than zero", 400
+
+    cursor.execute(
+        """
+        UPDATE beneficiaries
+        SET beneficiary_name = ?,
+            nickname = ?,
+            bank_name = ?,
+            ifsc_code = ?,
+            max_transfer_limit = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (new_name, new_nickname, new_bank, new_ifsc, new_limit, beneficiary_id),
+    )
+    db.commit()
+
+    log_event(
+        "BENEFICIARY_UPDATED",
+        user_id=user.id,
+        details=f"Updated beneficiary id {beneficiary_id} (A/C {row['account_number']})",
+    )
+    updated, _, _ = get_beneficiary_by_id(user, beneficiary_id)
+    return updated, None, 200
+
+
+def delete_beneficiary(user, beneficiary_id: int):
+    """Issue #17: Remove a saved beneficiary with ownership verification."""
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT id, user_id, beneficiary_name, account_number FROM beneficiaries WHERE id = ?",
+        (beneficiary_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, "Beneficiary not found", 404
+
+    if user.role == Role.CUSTOMER.value and row["user_id"] != user.id:
+        log_event(
+            "UNAUTHORIZED_BENEFICIARY_ACCESS",
+            user_id=user.id,
+            details=f"Customer {user.username} attempted to delete beneficiary id {beneficiary_id}",
+        )
+        return None, "Access forbidden: you do not own this beneficiary", 403
+
+    cursor.execute("DELETE FROM beneficiaries WHERE id = ?", (beneficiary_id,))
+    db.commit()
+
+    log_event(
+        "BENEFICIARY_DELETED",
+        user_id=user.id,
+        details=f"Deleted beneficiary '{row['beneficiary_name']}' (A/C {row['account_number']})",
+    )
+    return {"id": beneficiary_id, "account_number": row["account_number"]}, None, 200
+
+
+# ==============================================================================
 # 6. BLUEPRINT ROUTES
 # ==============================================================================
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -1673,6 +2010,7 @@ user_bp = Blueprint("users", __name__, url_prefix="/api/users")
 account_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfer_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
 loan_bp = Blueprint("loans", __name__, url_prefix="/api/loans")
+beneficiary_bp = Blueprint("beneficiaries", __name__, url_prefix="/api/beneficiaries")
 
 
 # --- Auth Endpoints (#2) ---
@@ -1917,6 +2255,7 @@ def transfer_from_account(account_id):
         destination_account_id=dest_acc_id,
         amount_rupees=amount,
         description=description,
+        beneficiary_id=data.get("beneficiary_id"),
     )
     if err:
         return jsonify({"error": err}), code
@@ -1957,6 +2296,7 @@ def initiate_transfer():
         destination_account_id=dest_acc_id,
         amount_rupees=amount,
         description=description,
+        beneficiary_id=data.get("beneficiary_id"),
     )
     if err:
         return jsonify({"error": err}), code
@@ -2116,6 +2456,76 @@ def decide_loan(loan_id):
     return jsonify({"message": f"Loan application {loan['status']} successfully", "loan": loan}), 200
 
 
+# --- Beneficiary Management Endpoints (#17) ---
+@beneficiary_bp.route("", methods=["POST"])
+@login_required
+def create_beneficiary_route():
+    """Issue #17: Add a new saved beneficiary."""
+    data = request.get_json(silent=True) or {}
+    ben_name = data.get("beneficiary_name") or data.get("name")
+    acc_num = data.get("account_number")
+    nickname = data.get("nickname")
+    bank_name = data.get("bank_name", "PES Bank")
+    ifsc_code = data.get("ifsc_code", "PESB0000001")
+    max_limit = data.get("max_transfer_limit")
+
+    ben, err, code = add_beneficiary(
+        user=current_user,
+        beneficiary_name=ben_name,
+        account_number=acc_num,
+        nickname=nickname,
+        bank_name=bank_name,
+        ifsc_code=ifsc_code,
+        max_transfer_limit_rupees=max_limit,
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Beneficiary added successfully", "beneficiary": ben}), 201
+
+
+@beneficiary_bp.route("", methods=["GET"])
+@login_required
+def list_beneficiaries_route():
+    """Issue #17: List saved beneficiaries for the authenticated user."""
+    search = request.args.get("search") or None
+    target_uid = request.args.get("user_id") or None
+    beneficiaries, err, code = get_beneficiaries(current_user, search=search, target_user_id=target_uid)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"beneficiaries": beneficiaries}), 200
+
+
+@beneficiary_bp.route("/<int:beneficiary_id>", methods=["GET"])
+@login_required
+def get_beneficiary_route(beneficiary_id):
+    """Issue #17: Get single beneficiary details."""
+    ben, err, code = get_beneficiary_by_id(current_user, beneficiary_id)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"beneficiary": ben}), 200
+
+
+@beneficiary_bp.route("/<int:beneficiary_id>", methods=["PATCH", "PUT"])
+@login_required
+def update_beneficiary_route(beneficiary_id):
+    """Issue #17: Update saved beneficiary details or transfer limit."""
+    data = request.get_json(silent=True) or {}
+    ben, err, code = update_beneficiary(current_user, beneficiary_id, data)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Beneficiary updated successfully", "beneficiary": ben}), 200
+
+
+@beneficiary_bp.route("/<int:beneficiary_id>", methods=["DELETE"])
+@login_required
+def delete_beneficiary_route(beneficiary_id):
+    """Issue #17: Remove a saved beneficiary."""
+    res, err, code = delete_beneficiary(current_user, beneficiary_id)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"message": "Beneficiary removed successfully", "deleted": res}), 200
+
+
 # ==============================================================================
 # 7. APP FACTORY
 # ==============================================================================
@@ -2189,6 +2599,7 @@ def create_app(custom_config=None):
     app.register_blueprint(account_bp)
     app.register_blueprint(transfer_bp)
     app.register_blueprint(loan_bp)
+    app.register_blueprint(beneficiary_bp)
 
     @app.errorhandler(sqlite3.Error)
     def err_database(e):
