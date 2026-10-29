@@ -1,4 +1,3 @@
-import time
 """
 PES University Bank Management System - Flask REST API Backend
 Implements:
@@ -10,9 +9,18 @@ Implements:
 - Issue #7: Transaction Validation & Recording
 - Issue #8: Fund Transfer Between Accounts
 - Issue #9: Atomic Transfer & Rollback
+- Issue #10: Loan Application
+- Issue #11: Loan Application Review
+- Issue #12: Loan Approval / Rejection & Status
+- Issue #13: Transaction History
+- Issue #14: Transaction Filtering & Pagination
+- Issue #15: Transaction Statement / Export
+- Issue #16: Transaction & Loan Notifications
+- Issue #17: Beneficiary Management
 - Issue #19: Data Security and Role Access
 - Issue #20: System Response Time
 - Issue #21: System Availability and Reliability
+- Issue #24: Backup and Recovery
 """
 import csv
 import io
@@ -20,13 +28,14 @@ import os
 import re
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import wraps
 
 import bcrypt
 from dotenv import load_dotenv
-from flask import Flask, Blueprint, request, jsonify, session, g, current_app
+from flask import Flask, Blueprint, request, jsonify, session, g, current_app, send_file
 from flask_cors import CORS
 from flask_login import (
     LoginManager,
@@ -37,9 +46,13 @@ from flask_login import (
     login_required,
 )
 
+import backup_manager
+
 load_dotenv()
 
 APP_START_TIME = time.time()
+DISPATCHED_NOTIFICATIONS_QUEUE = []
+
 
 # ==============================================================================
 # 1. CONSTANTS & ENUMS (#3, #4, #5, #6, #7, #8, #9)
@@ -93,6 +106,20 @@ DEFAULT_LOAN_RATES = {
     LoanType.VEHICLE.value: 9.5,
     LoanType.BUSINESS.value: 12.0,
 }
+
+
+class NotificationType(str, Enum):
+    TRANSACTION = "transaction"
+    LOAN = "loan"
+    SECURITY = "security"
+    SYSTEM = "system"
+
+
+class NotificationChannel(str, Enum):
+    IN_APP = "in_app"
+    EMAIL = "email"
+    SMS = "sms"
+
 
 
 # ==============================================================================
@@ -807,6 +834,17 @@ def execute_deposit(user, account_id: int, amount_rupees: str, description: str 
         details=f"Deposited ₹{paise_to_rupees_str(amount_paise)} to account {acc['account_number']} (Ref: {ref_id})",
     )
 
+    create_notification(
+        user_id=acc["user_id"],
+        title="Deposit Successful",
+        message=f"Deposited ₹{paise_to_rupees_str(amount_paise)} to account {acc['account_number']}. Ref: {ref_id}. New balance: ₹{paise_to_rupees_str(new_balance)}.",
+        notification_type=NotificationType.TRANSACTION.value,
+        event_type="deposit",
+        reference_id=ref_id,
+        db=db,
+    )
+
+
     return {
         "transaction_id": txn_id,
         "reference_id": ref_id,
@@ -889,6 +927,17 @@ def execute_withdrawal(user, account_id: int, amount_rupees: str, description: s
         user_id=user.id,
         details=f"Withdrew ₹{paise_to_rupees_str(amount_paise)} from account {acc['account_number']} (Ref: {ref_id})",
     )
+
+    create_notification(
+        user_id=acc["user_id"],
+        title="Withdrawal Successful",
+        message=f"Withdrew ₹{paise_to_rupees_str(amount_paise)} from account {acc['account_number']}. Ref: {ref_id}. New balance: ₹{paise_to_rupees_str(new_balance)}.",
+        notification_type=NotificationType.TRANSACTION.value,
+        event_type="withdrawal",
+        reference_id=ref_id,
+        db=db,
+    )
+
 
     return {
         "transaction_id": txn_id,
@@ -1146,6 +1195,27 @@ def execute_transfer(
         user_id=user.id,
         details=f"Transferred ₹{paise_to_rupees_str(amount_paise)} from {source_acc['account_number']} to {dest_acc['account_number']} (Ref: {transfer_ref})",
     )
+
+    create_notification(
+        user_id=source_acc["user_id"],
+        title="Fund Transfer Sent",
+        message=f"Transferred ₹{paise_to_rupees_str(amount_paise)} to account {dest_acc['account_number']}. Ref: {transfer_ref}. New balance: ₹{paise_to_rupees_str(new_source_balance)}.",
+        notification_type=NotificationType.TRANSACTION.value,
+        event_type="transfer_out",
+        reference_id=transfer_ref,
+        db=db,
+    )
+
+    create_notification(
+        user_id=dest_acc["user_id"],
+        title="Fund Transfer Received",
+        message=f"Received ₹{paise_to_rupees_str(amount_paise)} in account {dest_acc['account_number']} from account {source_acc['account_number']}. Ref: {transfer_ref}. New balance: ₹{paise_to_rupees_str(new_dest_balance)}.",
+        notification_type=NotificationType.TRANSACTION.value,
+        event_type="transfer_in",
+        reference_id=transfer_ref,
+        db=db,
+    )
+
 
     now_iso = datetime.now(timezone.utc).isoformat()
     transfer_payload = {
@@ -1521,6 +1591,17 @@ def submit_loan_application(
         user_id=user.id,
         details=f"Submitted {clean_type} loan application {ref_id} for ₹{paise_to_rupees_str(amount_paise)} ({term_months_int} months)",
     )
+
+    create_notification(
+        user_id=user.id,
+        title="Loan Application Submitted",
+        message=f"Your {clean_type} loan application (Ref: {ref_id}) for ₹{paise_to_rupees_str(amount_paise)} ({term_months_int} months) was submitted and is pending review.",
+        notification_type=NotificationType.LOAN.value,
+        event_type="loan_applied",
+        reference_id=ref_id,
+        db=db,
+    )
+
     loan_dict, _, _ = get_loan_by_id(user, loan_id)
     return loan_dict, None, 201
 
@@ -1693,6 +1774,28 @@ def review_loan_application(
         details=f"Loan {loan_row['reference_id']} {target_status} by {reviewer_user.username}"
         + (f" (Reason: {clean_reason})" if clean_reason else ""),
     )
+
+    if target_status == LoanStatus.APPROVED.value:
+        create_notification(
+            user_id=loan_row["user_id"],
+            title="Loan Application Approved",
+            message=f"Congratulations! Your loan application (Ref: {loan_row['reference_id']}) has been approved.",
+            notification_type=NotificationType.LOAN.value,
+            event_type="loan_approved",
+            reference_id=loan_row["reference_id"],
+            db=db,
+        )
+    else:
+        create_notification(
+            user_id=loan_row["user_id"],
+            title="Loan Application Rejected",
+            message=f"Your loan application (Ref: {loan_row['reference_id']}) was rejected. Reason: {clean_reason}",
+            notification_type=NotificationType.LOAN.value,
+            event_type="loan_rejected",
+            reference_id=loan_row["reference_id"],
+            db=db,
+        )
+
 
     updated_loan, _, _ = get_loan_by_id(reviewer_user, loan_id)
     return updated_loan, None, 200
@@ -2003,6 +2106,189 @@ def delete_beneficiary(user, beneficiary_id: int):
 
 
 # ==============================================================================
+# 5E. NOTIFICATION SERVICES (#16)
+# ==============================================================================
+def create_notification(
+    user_id: int,
+    title: str,
+    message: str,
+    notification_type: str = "transaction",
+    event_type: str = "deposit",
+    reference_id: str = None,
+    channel: str = "in_app",
+    db=None,
+) -> dict:
+    """
+    Issue #16: Generates notification for transaction and loan events.
+    Records notification to database, logs to audit trail, and simulates instant alert dispatch (IT_03).
+    """
+    if db is None:
+        db = get_db()
+    cursor = db.cursor()
+
+    clean_type = notification_type if notification_type in [t.value for t in NotificationType] else NotificationType.TRANSACTION.value
+    clean_channel = channel if channel in [c.value for c in NotificationChannel] else NotificationChannel.IN_APP.value
+
+    cursor.execute(
+        """
+        INSERT INTO notifications (user_id, title, message, notification_type, event_type, reference_id, channel, is_read)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (user_id, title, message, clean_type, event_type, reference_id, clean_channel),
+    )
+    notification_id = cursor.lastrowid
+    try:
+        db.commit()
+    except Exception:
+        pass
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = {
+        "id": notification_id,
+        "user_id": user_id,
+        "title": title,
+        "message": message,
+        "notification_type": clean_type,
+        "event_type": event_type,
+        "reference_id": reference_id,
+        "channel": clean_channel,
+        "is_read": False,
+        "created_at": now_iso,
+        "dispatched_at": time.time(),
+    }
+
+    DISPATCHED_NOTIFICATIONS_QUEUE.append(record)
+
+    try:
+        log_event(
+            "NOTIFICATION_SENT",
+            user_id=user_id,
+            details=f"Notification #{notification_id} dispatched to user {user_id}: {title} (Event: {event_type})",
+        )
+    except Exception:
+        pass
+
+    return record
+
+
+def get_user_notifications(
+    user,
+    unread_only: bool = False,
+    notification_type: str = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Issue #16: Retrieve notifications for authenticated user with unread filtering and pagination.
+    """
+    db = get_db()
+    cursor = db.cursor()
+
+    conditions = ["user_id = ?"]
+    params = [user.id]
+
+    if unread_only:
+        conditions.append("is_read = 0")
+
+    if notification_type:
+        clean_ntype = str(notification_type).strip().lower()
+        if clean_ntype in [t.value for t in NotificationType]:
+            conditions.append("notification_type = ?")
+            params.append(clean_ntype)
+
+    where_clause = " WHERE " + " AND ".join(conditions)
+
+    cursor.execute(f"SELECT COUNT(*) FROM notifications {where_clause}", params)
+    total_count = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0", (user.id,))
+    unread_count = cursor.fetchone()[0]
+
+    query = f"""
+        SELECT id, user_id, title, message, notification_type, event_type, reference_id, channel, is_read, created_at
+        FROM notifications
+        {where_clause}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(query, params + [limit, offset])
+    rows = cursor.fetchall()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "title": r["title"],
+            "message": r["message"],
+            "notification_type": r["notification_type"],
+            "event_type": r["event_type"],
+            "reference_id": r["reference_id"],
+            "channel": r["channel"],
+            "is_read": bool(r["is_read"]),
+            "created_at": str(r["created_at"]),
+        })
+
+    return {
+        "notifications": items,
+        "total_count": total_count,
+        "unread_count": unread_count,
+    }, None, 200
+
+
+def mark_notification_read(user, notification_id: int):
+    """
+    Issue #16: Mark a notification as read, enforcing user ownership.
+    """
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id, user_id, is_read FROM notifications WHERE id = ?", (notification_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None, "Notification not found", 404
+
+    if row["user_id"] != user.id and user.role != Role.ADMIN.value:
+        return None, "Access forbidden: you do not own this notification", 403
+
+    cursor.execute("UPDATE notifications SET is_read = 1 WHERE id = ?", (notification_id,))
+    db.commit()
+
+    return {"message": "Notification marked as read", "notification_id": notification_id}, None, 200
+
+
+def mark_all_notifications_read(user):
+    """
+    Issue #16: Mark all unread notifications for current user as read.
+    """
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0", (user.id,))
+    updated_count = cursor.rowcount
+    db.commit()
+    return {"message": "All notifications marked as read", "updated_count": updated_count}, None, 200
+
+
+def delete_notification(user, notification_id: int):
+    """
+    Issue #16: Delete notification with ownership enforcement.
+    """
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id, user_id FROM notifications WHERE id = ?", (notification_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None, "Notification not found", 404
+
+    if row["user_id"] != user.id and user.role != Role.ADMIN.value:
+        return None, "Access forbidden: you do not own this notification", 403
+
+    cursor.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
+    db.commit()
+    return {"message": "Notification deleted successfully"}, None, 200
+
+
+
+# ==============================================================================
 # 6. BLUEPRINT ROUTES
 # ==============================================================================
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -2011,6 +2297,9 @@ account_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfer_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
 loan_bp = Blueprint("loans", __name__, url_prefix="/api/loans")
 beneficiary_bp = Blueprint("beneficiaries", __name__, url_prefix="/api/beneficiaries")
+notification_bp = Blueprint("notifications", __name__, url_prefix="/api/notifications")
+backup_bp = Blueprint("backups", __name__, url_prefix="/api/admin/backups")
+
 
 
 # --- Auth Endpoints (#2) ---
@@ -2526,6 +2815,173 @@ def delete_beneficiary_route(beneficiary_id):
     return jsonify({"message": "Beneficiary removed successfully", "deleted": res}), 200
 
 
+# --- Notification Endpoints (#16) ---
+@notification_bp.route("", methods=["GET"])
+@notification_bp.route("/", methods=["GET"])
+@login_required
+def list_notifications_route():
+    unread_only = request.args.get("unread_only", "").lower() in ["true", "1", "yes"]
+    ntype = request.args.get("type", None)
+    try:
+        limit = min(int(request.args.get("limit", 50)), 100)
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (ValueError, TypeError):
+        limit = 50
+        offset = 0
+    data, err, status = get_user_notifications(
+        current_user, unread_only=unread_only, notification_type=ntype, limit=limit, offset=offset
+    )
+    if err:
+        return jsonify({"error": err}), status
+    return jsonify(data), status
+
+
+@notification_bp.route("/summary", methods=["GET"])
+@login_required
+def notification_summary_route():
+    data, err, status = get_user_notifications(current_user, unread_only=False, limit=5, offset=0)
+    if err:
+        return jsonify({"error": err}), status
+    return jsonify({
+        "unread_count": data["unread_count"],
+        "total_count": data["total_count"],
+        "latest": data["notifications"][:5],
+    }), 200
+
+
+@notification_bp.route("/<int:notification_id>/read", methods=["PATCH"])
+@login_required
+def read_notification_route(notification_id):
+    data, err, status = mark_notification_read(current_user, notification_id)
+    if err:
+        return jsonify({"error": err}), status
+    return jsonify(data), status
+
+
+@notification_bp.route("/mark-all-read", methods=["POST"])
+@login_required
+def mark_all_read_route():
+    data, err, status = mark_all_notifications_read(current_user)
+    if err:
+        return jsonify({"error": err}), status
+    return jsonify(data), status
+
+
+@notification_bp.route("/<int:notification_id>", methods=["DELETE"])
+@login_required
+def delete_notification_route(notification_id):
+    data, err, status = delete_notification(current_user, notification_id)
+    if err:
+        return jsonify({"error": err}), status
+    return jsonify(data), status
+
+
+# --- Backup & Recovery Endpoints (#24) ---
+@backup_bp.route("", methods=["POST"])
+@backup_bp.route("/", methods=["POST"])
+@login_required
+@role_required(Role.ADMIN.value)
+def admin_create_backup_route():
+    db_path = current_app.config.get("DATABASE_PATH") or os.environ.get(
+        "DATABASE_PATH",
+        os.path.join(os.path.dirname(__file__), "bank.db"),
+    )
+    b_dir = current_app.config.get("BACKUP_DIR")
+    try:
+        req_data = request.get_json(silent=True) or {}
+        note = req_data.get("note")
+        backup = backup_manager.create_backup(
+            db_path=db_path,
+            backup_dir=b_dir,
+            created_by_user_id=current_user.id,
+            trigger_type="manual",
+            note=note,
+        )
+        return jsonify({
+            "message": "Database backup created successfully",
+            "backup": backup,
+        }), 201
+    except Exception as e:
+        return jsonify({"error": f"Failed to create database backup: {str(e)}"}), 500
+
+
+@backup_bp.route("", methods=["GET"])
+@backup_bp.route("/", methods=["GET"])
+@login_required
+@role_required(Role.ADMIN.value)
+def admin_list_backups_route():
+    db_path = current_app.config.get("DATABASE_PATH") or os.environ.get(
+        "DATABASE_PATH",
+        os.path.join(os.path.dirname(__file__), "bank.db"),
+    )
+    b_dir = current_app.config.get("BACKUP_DIR")
+    backups = backup_manager.list_backups(db_path=db_path, backup_dir=b_dir)
+    return jsonify({"backups": backups, "count": len(backups)}), 200
+
+
+@backup_bp.route("/<backup_identifier>/verify", methods=["GET", "POST"])
+@login_required
+@role_required(Role.ADMIN.value)
+def admin_verify_backup_route(backup_identifier):
+    db_path = current_app.config.get("DATABASE_PATH") or os.environ.get(
+        "DATABASE_PATH",
+        os.path.join(os.path.dirname(__file__), "bank.db"),
+    )
+    b_dir = current_app.config.get("BACKUP_DIR")
+    result = backup_manager.verify_backup(backup_identifier, db_path=db_path, backup_dir=b_dir)
+    status_code = 200 if result.get("valid") else 400
+    return jsonify(result), status_code
+
+
+@backup_bp.route("/<backup_identifier>/restore", methods=["POST"])
+@login_required
+@role_required(Role.ADMIN.value)
+def admin_restore_backup_route(backup_identifier):
+    db_path = current_app.config.get("DATABASE_PATH") or os.environ.get(
+        "DATABASE_PATH",
+        os.path.join(os.path.dirname(__file__), "bank.db"),
+    )
+    b_dir = current_app.config.get("BACKUP_DIR")
+    try:
+        live_conn = get_db()
+        result = backup_manager.restore_backup(
+            backup_identifier=backup_identifier,
+            db_path=db_path,
+            backup_dir=b_dir,
+            restored_by_user_id=current_user.id,
+            live_conn=live_conn,
+        )
+        return jsonify({
+            "message": "Database restored successfully from backup",
+            "result": result,
+        }), 200
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to restore database: {str(e)}"}), 500
+
+
+@backup_bp.route("/<backup_identifier>/download", methods=["GET"])
+@login_required
+@role_required(Role.ADMIN.value)
+def admin_download_backup_route(backup_identifier):
+    db_path = current_app.config.get("DATABASE_PATH") or os.environ.get(
+        "DATABASE_PATH",
+        os.path.join(os.path.dirname(__file__), "bank.db"),
+    )
+    b_dir = current_app.config.get("BACKUP_DIR")
+    verification = backup_manager.verify_backup(backup_identifier, db_path=db_path, backup_dir=b_dir)
+    if not verification.get("valid") or not os.path.isfile(verification.get("filepath", "")):
+        return jsonify({"error": "Backup file not found or failed integrity check"}), 404
+    return send_file(
+        verification["filepath"],
+        as_attachment=True,
+        download_name=verification["filename"],
+        mimetype="application/x-sqlite3",
+    )
+
+
+
 # ==============================================================================
 # 7. APP FACTORY
 # ==============================================================================
@@ -2542,8 +2998,14 @@ def create_app(custom_config=None):
     cors_str = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
     app.config["CORS_ORIGINS"] = [x.strip() for x in cors_str.split(",") if x.strip()]
 
+    default_backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+    app.config["BACKUP_DIR"] = os.environ.get("BACKUP_DIR", default_backup_dir)
+
     if custom_config:
         app.config.update(custom_config)
+
+    os.makedirs(app.config["BACKUP_DIR"], exist_ok=True)
+
 
     app.teardown_appcontext(close_db)
 
@@ -2600,6 +3062,9 @@ def create_app(custom_config=None):
     app.register_blueprint(transfer_bp)
     app.register_blueprint(loan_bp)
     app.register_blueprint(beneficiary_bp)
+    app.register_blueprint(notification_bp)
+    app.register_blueprint(backup_bp)
+
 
     @app.errorhandler(sqlite3.Error)
     def err_database(e):

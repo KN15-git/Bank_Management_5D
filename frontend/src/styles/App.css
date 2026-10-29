@@ -446,3 +446,242 @@ body {
   .transaction-actions > button { width: 100%; }
   .pagination-controls { gap: 8px; font-size: .85rem; }
 }
+
+/* ==========================================================================
+   Issue #16: Notification Component & Drawer Styles
+   ========================================================================== */
+.notification-bell-container {
+  position: relative;
+  display: inline-block;
+}
+
+.notification-bell-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border-radius: 50%;
+  width: 38px;
+  height: 38px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.15rem;
+  transition: all 0.2s ease;
+  position: relative;
+}
+
+.notification-bell-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  transform: scale(1.05);
+}
+
+.notification-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: #e53e3e;
+  color: white;
+  font-size: 0.7rem;
+  font-weight: 700;
+  border-radius: 10px;
+  padding: 1px 6px;
+  min-width: 18px;
+  text-align: center;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+  animation: pulse-badge 2s infinite;
+}
+
+@keyframes pulse-badge {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+
+.notification-dropdown {
+  position: absolute;
+  right: 0;
+  top: 48px;
+  width: 380px;
+  max-width: 90vw;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  border: 1px solid #e2e8f0;
+  z-index: 1000;
+  overflow: hidden;
+  color: #1a202c;
+  animation: slide-down 0.2s ease-out;
+}
+
+@keyframes slide-down {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.notification-header {
+  padding: 14px 18px;
+  background: #f7fafc;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.notification-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #2d3748;
+}
+
+.notification-filter-tabs {
+  display: flex;
+  background: #edf2f7;
+  padding: 4px;
+  border-bottom: 1px solid #e2e8f0;
+  gap: 4px;
+}
+
+.notif-tab {
+  flex: 1;
+  padding: 6px 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #4a5568;
+  transition: all 0.15s ease;
+}
+
+.notif-tab.active {
+  background: #ffffff;
+  color: var(--primary);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.notification-list {
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.notification-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid #edf2f7;
+  transition: background 0.15s ease;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.notification-item:hover {
+  background: #f7fafc;
+}
+
+.notification-item.unread {
+  background: #ebf8ff;
+  border-left: 3px solid #3182ce;
+}
+
+.notif-icon {
+  font-size: 1.3rem;
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.notif-body {
+  flex: 1;
+}
+
+.notif-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.notif-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: #2d3748;
+}
+
+.notif-time {
+  font-size: 0.7rem;
+  color: #a0aec0;
+}
+
+.notif-message {
+  font-size: 0.8rem;
+  color: #4a5568;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.notif-ref {
+  display: inline-block;
+  font-size: 0.7rem;
+  background: #edf2f7;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-top: 4px;
+  font-family: monospace;
+  color: #4a5568;
+}
+
+.notif-empty {
+  padding: 30px 20px;
+  text-align: center;
+  color: #a0aec0;
+  font-size: 0.85rem;
+}
+
+/* ==========================================================================
+   Issue #24: Database Backup & Disaster Recovery Styles
+   ========================================================================== */
+.backup-card {
+  margin-top: 30px;
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 24px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+  border: 1px solid #e2e8f0;
+}
+
+.backup-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.checksum-hash {
+  font-family: monospace;
+  font-size: 0.75rem;
+  background: #edf2f7;
+  padding: 3px 6px;
+  border-radius: 4px;
+  color: #2d3748;
+  display: inline-block;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-safety {
+  background: #feebc8;
+  color: #7b341e;
+}
+
+.badge-restored {
+  background: #e9d8fd;
+  color: #44337a;
+}

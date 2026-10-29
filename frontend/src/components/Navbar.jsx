@@ -1,6 +1,7 @@
 import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { NotificationBell } from './NotificationBell';
 
 export const Navbar = () => {
   const { user, logout } = useAuth();
@@ -29,6 +30,7 @@ export const Navbar = () => {
               {user.role === 'admin' && (
                 <Link to="/admin" className="nav-item">User Management</Link>
               )}
+              <NotificationBell />
               <div className="user-badge">
                 <span className="user-name">{user.full_name}</span>
                 <span className={`role-pill role-${user.role}`}>{user.role}</span>
@@ -38,6 +40,7 @@ export const Navbar = () => {
               </button>
             </>
           ) : (
+
             <>
               <Link to="/login" className="nav-item">Login</Link>
               <Link to="/register" className="btn btn-primary btn-sm">Register</Link>
