@@ -685,3 +685,29 @@ body {
   background: #e9d8fd;
   color: #44337a;
 }
+
+/* Issue #18: Profile and account settings */
+.profile-settings-page { display: flex; flex-direction: column; gap: 22px; }
+.profile-page-header { gap: 16px; flex-wrap: wrap; }
+.profile-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
+.profile-settings-grid .card h2 { font-size: 1.2rem; margin-bottom: 6px; }
+.profile-readonly-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; background: var(--bg-main); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin: 18px 0; }
+.profile-readonly-grid strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+.field-help { display: block; color: var(--text-muted); margin-top: 6px; font-size: .8rem; }
+
+/* Issue #23: visible keyboard focus, motion preference and responsive navigation */
+:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
+button:disabled { opacity: .6; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+@media (max-width: 760px) {
+  .profile-settings-grid { grid-template-columns: 1fr; }
+  .nav-container { align-items: flex-start; gap: 12px; flex-direction: column; }
+  .nav-links { width: 100%; flex-wrap: wrap; gap: 10px 14px; }
+  .profile-page-header { align-items: flex-start; }
+}
+@media (max-width: 420px) {
+  .profile-readonly-grid { grid-template-columns: 1fr; }
+  .profile-settings-grid .card { padding: 18px; }
+}
