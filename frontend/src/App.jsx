@@ -9,6 +9,7 @@ import { AccountDetailPage } from './pages/AccountDetailPage';
 import { EmployeeDashboard } from './pages/EmployeeDashboard';
 import { AdminDashboard } from './pages/AdminDashboard';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
+import { ProfileSettingsPage } from './pages/ProfileSettingsPage';
 import { useAuth } from './context/AuthContext';
 import './styles/App.css';
 
@@ -34,6 +35,14 @@ export const App = () => {
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/unauthorized" element={<UnauthorizedPage />} />
+          <Route
+            path="/profile"
+            element={
+              <ProtectedRoute roles={['customer', 'employee', 'admin']}>
+                <ProfileSettingsPage />
+              </ProtectedRoute>
+            }
+          />
 
           {/* Customer Routes */}
           <Route

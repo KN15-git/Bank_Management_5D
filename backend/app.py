@@ -322,16 +322,26 @@ def generate_csrf_token() -> str:
 def verify_csrf_token():
     """
     CSRF Protection (Synchronizer Token Pattern):
-    State-changing requests (POST, PUT, PATCH, DELETE) require a matching X-CSRF-Token header.
-    Public initial endpoints (login, register) are exempt.
+    State-changing requests require a matching X-CSRF-Token header once a
+    user is authenticated. Public authentication endpoints and unauthenticated
+    requests are allowed through so Flask-Login can return the correct 401
+    response for protected routes. This does not grant access to those routes.
     """
-    if request.method in ["POST", "PUT", "PATCH", "DELETE"]:
-        if request.endpoint in ["auth.login", "auth.register"]:
-            return None
-        token = request.headers.get("X-CSRF-Token")
-        expected = session.get("csrf_token")
-        if not expected or not token or not secrets.compare_digest(token, expected):
-            return jsonify({"error": "Invalid or missing CSRF token"}), 403
+    if request.method not in ["POST", "PUT", "PATCH", "DELETE"]:
+        return None
+
+    if request.endpoint in ["auth.login", "auth.register"]:
+        return None
+
+    # CSRF is meaningful for an authenticated browser session. Let the route's
+    # @login_required / role guard reject anonymous requests with HTTP 401/403.
+    if not current_user.is_authenticated:
+        return None
+
+    token = request.headers.get("X-CSRF-Token")
+    expected = session.get("csrf_token")
+    if not expected or not token or not secrets.compare_digest(token, expected):
+        return jsonify({"error": "Invalid or missing CSRF token"}), 403
     return None
 
 
@@ -2626,6 +2636,77 @@ def get_me():
     if not current_user.is_authenticated:
         return jsonify({"error": "Not authenticated"}), 401
     return jsonify({"user": current_user.to_dict(), "csrf_token": generate_csrf_token()}), 200
+
+
+@auth_bp.route("/profile", methods=["PATCH"])
+@login_required
+def update_profile():
+    """Update the authenticated user's editable profile fields (#18)."""
+    data = request.get_json(silent=True) or {}
+    full_name = data.get("full_name")
+    email = data.get("email")
+
+    if not isinstance(full_name, str) or not full_name.strip():
+        return jsonify({"error": "Full name is required"}), 400
+    if not isinstance(email, str) or not email.strip():
+        return jsonify({"error": "Email is required"}), 400
+
+    full_name = full_name.strip()
+    email = email.strip().lower()
+    if len(full_name) > 100:
+        return jsonify({"error": "Full name must be 100 characters or fewer"}), 400
+    if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        return jsonify({"error": "Enter a valid email address"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = ? AND id != ?", (email, current_user.id))
+    if cursor.fetchone():
+        return jsonify({"error": "Email address is already in use"}), 409
+
+    cursor.execute(
+        "UPDATE users SET full_name = ?, email = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (full_name, email, current_user.id),
+    )
+    db.commit()
+    log_event("PROFILE_UPDATED", user_id=current_user.id, details="Updated profile name and email")
+    updated_user = get_user_by_id(current_user.id)
+    return jsonify({"message": "Profile updated successfully", "user": updated_user.to_dict()}), 200
+
+
+@auth_bp.route("/password", methods=["PATCH"])
+@login_required
+def update_password():
+    """Change the authenticated user's password after verifying the current password (#18)."""
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password")
+    new_password = data.get("new_password")
+    if not isinstance(current_password, str) or not current_password:
+        return jsonify({"error": "Current password is required"}), 400
+    if not isinstance(new_password, str) or not new_password:
+        return jsonify({"error": "New password is required"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT password_hash FROM users WHERE id = ?", (current_user.id,))
+    row = cursor.fetchone()
+    if not row or not check_password(current_password, row["password_hash"]):
+        log_event("PASSWORD_CHANGE_FAILED", user_id=current_user.id, details="Incorrect current password")
+        return jsonify({"error": "Current password is incorrect"}), 400
+
+    valid, message = validate_password_policy(new_password)
+    if not valid:
+        return jsonify({"error": message}), 400
+    if check_password(new_password, row["password_hash"]):
+        return jsonify({"error": "New password must be different from the current password"}), 400
+
+    cursor.execute(
+        "UPDATE users SET password_hash = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (hash_password(new_password), current_user.id),
+    )
+    db.commit()
+    log_event("PASSWORD_CHANGED", user_id=current_user.id, details="Password changed successfully")
+    return jsonify({"message": "Password changed successfully"}), 200
 
 
 # --- User & RBAC Endpoints (#3) ---

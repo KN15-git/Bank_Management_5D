@@ -31,6 +31,7 @@ export const Navbar = () => {
                 <Link to="/admin" className="nav-item">User Management</Link>
               )}
               <NotificationBell />
+              <Link to="/profile" className="nav-item" aria-label="Profile and account settings">Profile &amp; Settings</Link>
               <div className="user-badge">
                 <span className="user-name">{user.full_name}</span>
                 <span className={`role-pill role-${user.role}`}>{user.role}</span>
