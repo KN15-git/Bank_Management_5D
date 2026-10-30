@@ -1250,3 +1250,130 @@ def test_issue_17_beneficiary_ownership_isolation_and_transfer_integration(clien
         json={"nickname": "Hijacked"},
     ).status_code == 403
     assert client.delete(f"/api/beneficiaries/{ben_id}", headers={"X-CSRF-Token": csrf2}).status_code == 403
+
+
+# ==============================================================================
+# ISSUE #22: AUDIT LOGGING & COMPLIANCE TRAIL TESTS
+# ==============================================================================
+def test_issue_22_audit_logs_rbac_and_comprehensive_event_recording(client):
+    """
+    Issue #22: Customers and employees are forbidden from viewing system audit logs (403);
+    Administrators can query and inspect audit logs capturing auth, transaction, and RBAC events.
+    """
+    # 1. Customer login + deposit + unauthorized admin attempt generates audit events
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf_cust = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    client.post(
+        "/api/accounts/1/deposit",
+        headers={"X-CSRF-Token": csrf_cust},
+        json={"amount": "200.00", "description": "Audit trail test deposit"},
+    )
+
+    # Customer is forbidden from accessing audit logs (and this attempt itself is logged as ACCESS_DENIED)
+    cust_audit_res = client.get("/api/audit-logs")
+    assert cust_audit_res.status_code == 403
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf_cust})
+
+    # 2. Employee is also forbidden from accessing system-wide audit logs
+    client.post("/api/auth/login", json={"username": "emp1", "password": "EmpPass1"})
+    csrf_emp = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    assert client.get("/api/audit-logs").status_code == 403
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf_emp})
+
+    # 3. Admin can list and inspect audit logs via both /api/audit-logs and /api/admin/audit-logs
+    client.post("/api/auth/login", json={"username": "admin1", "password": "AdminPass1"})
+    res = client.get("/api/audit-logs")
+    assert res.status_code == 200
+    data = res.get_json()
+    assert "audit_logs" in data
+    assert "pagination" in data
+    assert "summary" in data
+    assert data["pagination"]["total"] >= 4
+
+    actions_logged = {entry["action"] for entry in data["audit_logs"]}
+    assert "LOGIN_SUCCESS" in actions_logged
+    assert "DEPOSIT_PROCESSED" in actions_logged
+    assert "ACCESS_DENIED" in actions_logged
+
+    # Inspect single audit log entry
+    first_id = data["audit_logs"][0]["id"]
+    detail_res = client.get(f"/api/admin/audit-logs/{first_id}")
+    assert detail_res.status_code == 200
+    assert detail_res.get_json()["audit_log"]["id"] == first_id
+    assert client.get("/api/audit-logs/999999").status_code == 404
+
+
+def test_issue_22_audit_logs_filtering_pagination_and_validation(client):
+    """Issue #22: Verify filtering by category, severity, action, user_id, search, date range, and input validation."""
+    client.post("/api/auth/login", json={"username": "cust1", "password": "CustPass1"})
+    csrf_cust = client.get("/api/auth/csrf").get_json()["csrf_token"]
+    client.post(
+        "/api/accounts/1/deposit",
+        headers={"X-CSRF-Token": csrf_cust},
+        json={"amount": "150.00", "description": "UniqueAuditSearchToken"},
+    )
+    client.get("/api/users")  # Triggers ACCESS_DENIED (critical severity, access_control category)
+    client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf_cust})
+
+    client.post("/api/auth/login", json={"username": "admin1", "password": "AdminPass1"})
+
+    # Filter by category=transaction
+    txn_logs = client.get("/api/audit-logs?category=transaction").get_json()["audit_logs"]
+    assert len(txn_logs) >= 1
+    assert all(item["category"] == "transaction" for item in txn_logs)
+
+    # Filter by severity=critical
+    crit_logs = client.get("/api/audit-logs?severity=critical").get_json()["audit_logs"]
+    assert len(crit_logs) >= 1
+    assert all(item["severity"] == "critical" for item in crit_logs)
+
+    # Filter by action=DEPOSIT_PROCESSED
+    act_logs = client.get("/api/audit-logs?action=DEPOSIT_PROCESSED").get_json()["audit_logs"]
+    assert len(act_logs) >= 1
+    assert all(item["action"] == "DEPOSIT_PROCESSED" for item in act_logs)
+
+    # Filter by search keyword
+    search_logs = client.get("/api/audit-logs?search=100000000001").get_json()["audit_logs"]
+    assert len(search_logs) >= 1
+
+    # Validation errors on bad filters
+    assert client.get("/api/audit-logs?category=invalid_cat").status_code == 400
+    assert client.get("/api/audit-logs?severity=extreme").status_code == 400
+    assert client.get("/api/audit-logs?sort_order=random").status_code == 400
+    assert client.get("/api/audit-logs?page=0").status_code == 400
+    assert client.get("/api/audit-logs?date_from=2026-99-99").status_code == 400
+    assert client.get("/api/audit-logs?date_from=2026-10-30&date_to=2026-10-01").status_code == 400
+
+
+def test_issue_22_audit_logs_csv_export_and_immutability(client):
+    """
+    Issue #22: Verify CSV compliance export and database-level immutability triggers
+    that prevent modifying or deleting existing audit log records.
+    """
+    import sqlite3
+
+    client.post("/api/auth/login", json={"username": "admin1", "password": "AdminPass1"})
+
+    # 1. Export audit logs to CSV
+    export_res = client.get("/api/audit-logs/export?category=authentication")
+    assert export_res.status_code == 200
+    assert "text/csv" in export_res.headers.get("Content-Type", "")
+    assert "system_audit_logs.csv" in export_res.headers.get("Content-Disposition", "")
+    csv_text = export_res.get_data(as_text=True)
+    assert "Log ID,Timestamp (UTC),User ID,Username,Role,Action,Category,Severity,Details,IP Address" in csv_text
+    assert "LOGIN_SUCCESS" in csv_text
+
+    # 2. Verify audit_logs rows are immutable (cannot be updated or deleted)
+    with client.application.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT id FROM audit_logs LIMIT 1")
+        row = cursor.fetchone()
+        assert row is not None
+        log_id = row["id"]
+
+        with pytest.raises(sqlite3.IntegrityError, match="Audit logs are immutable"):
+            cursor.execute("UPDATE audit_logs SET action = 'TAMPERED' WHERE id = ?", (log_id,))
+
+        with pytest.raises(sqlite3.IntegrityError, match="Audit logs are immutable"):
+            cursor.execute("DELETE FROM audit_logs WHERE id = ?", (log_id,))
