@@ -2289,6 +2289,282 @@ def delete_notification(user, notification_id: int):
 
 
 # ==============================================================================
+# 5F. AUDIT LOGGING & COMPLIANCE SERVICES (#22)
+# ==============================================================================
+VALID_AUDIT_CATEGORIES = {
+    "authentication",
+    "access_control",
+    "account",
+    "transaction",
+    "loan",
+    "beneficiary",
+    "system",
+}
+
+VALID_AUDIT_SEVERITIES = {"info", "warning", "critical"}
+
+
+def _classify_audit_action(action: str) -> tuple[str, str]:
+    """Classify an audit action into (category, severity) for compliance filtering (#22)."""
+    act = (action or "").upper()
+
+    # Severity classification
+    if any(
+        kw in act
+        for kw in (
+            "ACCESS_DENIED",
+            "UNAUTHORIZED",
+            "LOCKED",
+            "ROLLED_BACK",
+            "RESTORED",
+        )
+    ):
+        severity = "critical"
+    elif any(
+        kw in act
+        for kw in (
+            "FAILED",
+            "REJECTED",
+            "ROLE_CHANGED",
+            "STATUS_CHANGED",
+            "DELETED",
+        )
+    ):
+        severity = "warning"
+    else:
+        severity = "info"
+
+    # Category classification
+    if act.startswith(("LOGIN", "LOGOUT", "REGISTER")) or "LOCKED" in act:
+        category = "authentication"
+    elif (
+        act.startswith(("ACCESS_DENIED", "UNAUTHORIZED", "USER_ROLE", "USER_STATUS"))
+    ):
+        category = "access_control"
+    elif act.startswith("ACCOUNT_"):
+        category = "account"
+    elif act.startswith(("DEPOSIT_", "WITHDRAWAL_", "TRANSFER_")):
+        category = "transaction"
+    elif act.startswith("LOAN_"):
+        category = "loan"
+    elif act.startswith("BENEFICIARY_"):
+        category = "beneficiary"
+    else:
+        category = "system"
+
+    return category, severity
+
+
+def _format_audit_log_row(row) -> dict:
+    category, severity = _classify_audit_action(row["action"])
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "username": row["username"] or "system/anonymous",
+        "user_full_name": row["full_name"] or "System / Unauthenticated",
+        "user_role": row["role"] or "system",
+        "action": row["action"],
+        "category": category,
+        "severity": severity,
+        "details": row["details"] or "",
+        "ip_address": row["ip_address"] or "system",
+        "created_at": str(row["created_at"]),
+    }
+
+
+def get_audit_logs(
+    user,
+    action: str = None,
+    category: str = None,
+    severity: str = None,
+    target_user_id=None,
+    search: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    sort_order: str = "desc",
+    page=1,
+    per_page=25,
+):
+    """
+    Issue #22: Query immutable system audit logs with filtering, date range, and pagination.
+    Restricted to Administrator role.
+    """
+    from datetime import date
+
+    if user.role != Role.ADMIN.value:
+        return None, "Access forbidden: insufficient permissions", 403
+
+    clean_action = str(action).strip().upper() if action and str(action).strip() else None
+    clean_category = str(category).strip().lower() if category and str(category).strip() else None
+    clean_severity = str(severity).strip().lower() if severity and str(severity).strip() else None
+    clean_search = str(search).strip() if search and str(search).strip() else None
+    clean_sort = str(sort_order or "desc").strip().lower()
+
+    if clean_category and clean_category not in VALID_AUDIT_CATEGORIES:
+        return (
+            None,
+            f"Invalid category filter. Allowed: {', '.join(sorted(VALID_AUDIT_CATEGORIES))}",
+            400,
+        )
+    if clean_severity and clean_severity not in VALID_AUDIT_SEVERITIES:
+        return (
+            None,
+            f"Invalid severity filter. Allowed: {', '.join(sorted(VALID_AUDIT_SEVERITIES))}",
+            400,
+        )
+    if clean_sort not in {"asc", "desc"}:
+        return None, "Invalid sort_order. Allowed: asc, desc", 400
+
+    parsed_user_id = None
+    if target_user_id is not None and str(target_user_id).strip() != "":
+        try:
+            parsed_user_id = int(target_user_id)
+        except (TypeError, ValueError):
+            return None, "user_id must be a valid integer", 400
+
+    try:
+        page_int = int(page)
+        per_page_int = int(per_page)
+    except (TypeError, ValueError):
+        return None, "page and per_page must be integers", 400
+    if page_int < 1:
+        return None, "page must be at least 1", 400
+    if per_page_int < 1:
+        return None, "per_page must be at least 1", 400
+    per_page_int = min(per_page_int, 100)
+
+    date_to_exclusive = None
+    try:
+        for label, value in (("date_from", date_from), ("date_to", date_to)):
+            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value)):
+                return None, f"{label} must use YYYY-MM-DD format", 400
+        if date_from:
+            date.fromisoformat(date_from)
+        if date_to:
+            end_date = date.fromisoformat(date_to)
+            date_to_exclusive = (end_date + timedelta(days=1)).isoformat()
+        if date_from and date_to and date.fromisoformat(date_from) > date.fromisoformat(date_to):
+            return None, "date_from cannot be after date_to", 400
+    except ValueError:
+        return None, "Dates must use YYYY-MM-DD format", 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    conditions = ["1=1"]
+    params = []
+
+    if clean_action:
+        conditions.append("UPPER(al.action) = ?")
+        params.append(clean_action)
+
+    if parsed_user_id is not None:
+        conditions.append("al.user_id = ?")
+        params.append(parsed_user_id)
+
+    if clean_search:
+        term = f"%{clean_search.lower()}%"
+        conditions.append(
+            "(LOWER(al.action) LIKE ? OR LOWER(COALESCE(al.details, '')) LIKE ? "
+            "OR LOWER(COALESCE(al.ip_address, '')) LIKE ? OR LOWER(COALESCE(u.username, '')) LIKE ? "
+            "OR LOWER(COALESCE(u.full_name, '')) LIKE ?)"
+        )
+        params.extend([term, term, term, term, term])
+
+    if date_from:
+        conditions.append("date(al.created_at) >= date(?)")
+        params.append(date_from)
+
+    if date_to_exclusive:
+        conditions.append("datetime(al.created_at) < datetime(?)")
+        params.append(date_to_exclusive)
+
+    where_sql = " AND ".join(conditions)
+    order_dir = "ASC" if clean_sort == "asc" else "DESC"
+
+    cursor.execute(
+        f"""
+        SELECT al.id, al.user_id, al.action, al.details, al.ip_address, al.created_at,
+               u.username, u.full_name, u.role
+        FROM audit_logs al
+        LEFT JOIN users u ON al.user_id = u.id
+        WHERE {where_sql}
+        ORDER BY al.id {order_dir}
+        """,
+        params,
+    )
+    all_rows = cursor.fetchall()
+    formatted_all = [_format_audit_log_row(r) for r in all_rows]
+
+    if clean_category:
+        formatted_all = [item for item in formatted_all if item["category"] == clean_category]
+    if clean_severity:
+        formatted_all = [item for item in formatted_all if item["severity"] == clean_severity]
+
+    total = len(formatted_all)
+    offset = (page_int - 1) * per_page_int
+    paged_logs = formatted_all[offset : offset + per_page_int]
+    offset_end = offset + len(paged_logs)
+
+    cursor.execute("SELECT DISTINCT action FROM audit_logs ORDER BY action ASC")
+    available_actions = [r["action"] for r in cursor.fetchall()]
+
+    security_alerts_count = sum(
+        1 for item in formatted_all if item["severity"] in ("critical", "warning")
+    )
+
+    return {
+        "audit_logs": paged_logs,
+        "pagination": {
+            "page": page_int,
+            "per_page": per_page_int,
+            "total": total,
+            "total_pages": (total + per_page_int - 1) // per_page_int if total > 0 else 0,
+            "has_next": offset_end < total,
+            "has_previous": page_int > 1 and offset < total,
+        },
+        "filters": {
+            "action": clean_action,
+            "category": clean_category,
+            "severity": clean_severity,
+            "user_id": parsed_user_id,
+            "search": clean_search,
+            "date_from": date_from,
+            "date_to": date_to,
+            "sort_order": clean_sort,
+        },
+        "summary": {
+            "total_matching": total,
+            "security_alerts_count": security_alerts_count,
+            "available_actions": available_actions,
+        },
+    }, None, 200
+
+
+def get_audit_log_by_id(user, log_id: int):
+    """Issue #22: Retrieve a single audit log entry by ID (Admin only)."""
+    if user.role != Role.ADMIN.value:
+        return None, "Access forbidden: insufficient permissions", 403
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        """
+        SELECT al.id, al.user_id, al.action, al.details, al.ip_address, al.created_at,
+               u.username, u.full_name, u.role
+        FROM audit_logs al
+        LEFT JOIN users u ON al.user_id = u.id
+        WHERE al.id = ?
+        """,
+        (log_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, "Audit log entry not found", 404
+    return _format_audit_log_row(row), None, 200
+
+
+# ==============================================================================
 # 6. BLUEPRINT ROUTES
 # ==============================================================================
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -2299,6 +2575,7 @@ loan_bp = Blueprint("loans", __name__, url_prefix="/api/loans")
 beneficiary_bp = Blueprint("beneficiaries", __name__, url_prefix="/api/beneficiaries")
 notification_bp = Blueprint("notifications", __name__, url_prefix="/api/notifications")
 backup_bp = Blueprint("backups", __name__, url_prefix="/api/admin/backups")
+audit_bp = Blueprint("audit_logs", __name__, url_prefix="/api/audit-logs")
 
 
 
@@ -2982,6 +3259,113 @@ def admin_download_backup_route(backup_identifier):
 
 
 
+# --- Audit Logging & Compliance Endpoints (#22) ---
+@audit_bp.route("", methods=["GET"])
+@audit_bp.route("/", methods=["GET"])
+@role_required(Role.ADMIN.value)
+def list_audit_logs_route():
+    """Issue #22: List and filter system audit logs with pagination and summary."""
+    result, err, code = get_audit_logs(
+        user=current_user,
+        action=request.args.get("action") or None,
+        category=request.args.get("category") or None,
+        severity=request.args.get("severity") or None,
+        target_user_id=request.args.get("user_id") or None,
+        search=request.args.get("search") or None,
+        date_from=request.args.get("date_from") or None,
+        date_to=request.args.get("date_to") or None,
+        sort_order=request.args.get("sort_order", "desc"),
+        page=request.args.get("page", 1),
+        per_page=request.args.get("per_page", 25),
+    )
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify(result), 200
+
+
+@audit_bp.route("/<int:log_id>", methods=["GET"])
+@role_required(Role.ADMIN.value)
+def get_audit_log_detail_route(log_id):
+    """Issue #22: Inspect a single audit log entry."""
+    log_entry, err, code = get_audit_log_by_id(current_user, log_id)
+    if err:
+        return jsonify({"error": err}), code
+    return jsonify({"audit_log": log_entry}), 200
+
+
+@audit_bp.route("/export", methods=["GET"])
+@role_required(Role.ADMIN.value)
+def export_audit_logs_route():
+    """Issue #22: Export filtered audit logs as a CSV compliance report."""
+    common_filters = {
+        "action": request.args.get("action") or None,
+        "category": request.args.get("category") or None,
+        "severity": request.args.get("severity") or None,
+        "target_user_id": request.args.get("user_id") or None,
+        "search": request.args.get("search") or None,
+        "date_from": request.args.get("date_from") or None,
+        "date_to": request.args.get("date_to") or None,
+        "sort_order": request.args.get("sort_order", "desc"),
+    }
+    first_page, err, code = get_audit_logs(
+        current_user, page=1, per_page=100, **common_filters
+    )
+    if err:
+        return jsonify({"error": err}), code
+
+    logs = list(first_page["audit_logs"])
+    for page_num in range(2, first_page["pagination"]["total_pages"] + 1):
+        next_page, err, code = get_audit_logs(
+            current_user, page=page_num, per_page=100, **common_filters
+        )
+        if err:
+            return jsonify({"error": err}), code
+        logs.extend(next_page["audit_logs"])
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Log ID",
+        "Timestamp (UTC)",
+        "User ID",
+        "Username",
+        "Role",
+        "Action",
+        "Category",
+        "Severity",
+        "Details",
+        "IP Address",
+    ])
+    for entry in logs:
+        details = entry["details"] or ""
+        if details.startswith(("=", "+", "-", "@", "\t", "\r")):
+            details = "'" + details
+        writer.writerow([
+            entry["id"],
+            entry["created_at"],
+            entry["user_id"] if entry["user_id"] is not None else "",
+            entry["username"],
+            entry["user_role"],
+            entry["action"],
+            entry["category"],
+            entry["severity"],
+            details,
+            entry["ip_address"],
+        ])
+
+    log_event(
+        "AUDIT_REPORT_EXPORTED",
+        user_id=current_user.id,
+        details=f"Admin {current_user.username} exported {len(logs)} audit log entries to CSV",
+    )
+
+    from flask import Response
+    response = Response("\ufeff" + output.getvalue(), mimetype="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = 'attachment; filename="system_audit_logs.csv"'
+    response.headers["Cache-Control"] = "no-store"
+    return response, 200
+
+
 # ==============================================================================
 # 7. APP FACTORY
 # ==============================================================================
@@ -3064,6 +3448,8 @@ def create_app(custom_config=None):
     app.register_blueprint(beneficiary_bp)
     app.register_blueprint(notification_bp)
     app.register_blueprint(backup_bp)
+    app.register_blueprint(audit_bp)
+    app.register_blueprint(audit_bp, name="admin_audit_logs", url_prefix="/api/admin/audit-logs")
 
 
     @app.errorhandler(sqlite3.Error)
