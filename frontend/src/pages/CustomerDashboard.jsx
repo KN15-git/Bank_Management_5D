@@ -358,7 +358,7 @@ export const CustomerDashboard = () => {
         </div>
       )}
 
-      {/* Saved Beneficiaries Section (Issue #17) */}
+      {/* Saved Beneficiaries Section */}
       <section style={{ marginTop: '2.5rem' }}>
         <div className="page-header" style={{ marginBottom: '1rem' }}>
           <div>
@@ -422,7 +422,7 @@ export const CustomerDashboard = () => {
         )}
       </section>
 
-      {/* Loan Applications Section (Issues #10 & #12) */}
+      {/* Loan Applications Section */}
       <section style={{ marginTop: '2.5rem' }}>
         <div className="page-header" style={{ marginBottom: '1rem' }}>
           <div>

@@ -273,7 +273,7 @@ export const EmployeeDashboard = () => {
         </div>
       )}
 
-      {/* Loan Applications Review Queue Section (Issues #11 & #12) */}
+      {/* Loan Applications Review Queue Section */}
       <section style={{ marginTop: '2.5rem' }}>
         <div className="page-header" style={{ marginBottom: '1rem' }}>
           <div>

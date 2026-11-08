@@ -246,7 +246,8 @@ export const AccountDetailPage = () => {
 
       {/* Transaction Action Form (Deposit / Withdraw / Transfer) */}
       <div className="card transaction-action-card">
-        <h3>Transact: Deposit, Withdraw &amp; Transfer (Issues #5, #6, #8, #9)</h3>
+        <h3>Account Operations</h3>
+        <p className="subtitle">Execute deposits, withdrawals, or inter-account fund transfers</p>
         {isClosed && (
           <div className="alert alert-danger">
             This account is closed. No further deposits, withdrawals, or transfers are permitted.
@@ -348,7 +349,7 @@ export const AccountDetailPage = () => {
         )}
       </div>
 
-      {/* Transaction History (Issues #13, #14 and #15) */}
+      {/* Transaction History */}
       <div className="card transaction-ledger-card">
         <div className="card-header-simple">
           <div>

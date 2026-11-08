@@ -221,6 +221,7 @@ body {
   gap: 20px;
 }
 .account-card, .card {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
   background: var(--bg-card);
   border-radius: var(--radius);
   padding: 20px;
@@ -235,6 +236,10 @@ body {
 .account-card.status-frozen { border-left: 4px solid var(--warning); }
 .account-card.status-closed { border-left: 4px solid var(--danger); opacity: 0.8; }
 .account-card.status-active { border-left: 4px solid var(--success); }
+.account-card:hover {
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -2px rgba(0, 0, 0, 0.04);
+  transform: translateY(-2px);
+}
 
 .account-card-header, .card-header-simple {
   display: flex;
