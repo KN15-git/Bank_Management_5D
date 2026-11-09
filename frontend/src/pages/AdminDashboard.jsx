@@ -322,7 +322,7 @@ export const AdminDashboard = () => {
           <div>
             <h2>💾 Database Backup &amp; Disaster Recovery</h2>
             <p className="subtitle">
-              Online SQLite snapshots, SHA-256 integrity verification, and atomic rollback (Issue #24, SEC-07, SEC-10)
+              Automated SQLite snapshots with SHA-256 integrity verification and atomic rollback
             </p>
           </div>
           <button
@@ -430,7 +430,7 @@ export const AdminDashboard = () => {
           <div>
             <h2>🛡️ System Audit Logs &amp; Security Trail</h2>
             <p className="subtitle">
-              Immutable compliance log of authentication, RBAC, account, transaction, and loan events (Issue #22) &bull;{' '}
+              Immutable compliance log of authentication, access control, account, transaction, and loan events &bull;{' '}
               <strong>{auditSummary.total_matching}</strong> matching events ({auditSummary.security_alerts_count} warnings/critical)
             </p>
           </div>
