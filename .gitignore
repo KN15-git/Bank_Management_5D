@@ -11,6 +11,8 @@ ENV/
 *.db
 .env
 .pytest_cache/
+.coverage
+.coverage.*
 
 # Node
 frontend/node_modules/
